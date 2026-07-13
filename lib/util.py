@@ -358,8 +358,13 @@ def get_device():  # -> torch.device
     return torch.device(
         'cuda:0'
         if torch.cuda.is_available()
-        # else 'mps:0'
-        # if torch.mps.is_available()
+        # MPS is opt-in: some operations used by the models are not implemented for
+        # MPS, so PyTorch must be explicitly allowed to fall back to CPU for them.
+        else 'mps:0'
+        if (
+            torch.mps.is_available()
+            and os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK') == '1'
+        )
         else 'cpu'
     )
 
