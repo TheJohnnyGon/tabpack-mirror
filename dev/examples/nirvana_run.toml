@@ -1,0 +1,29 @@
+# Usage:
+# uv run --isolated --no-dev --group yandex -m dev.lib.nirvana.run from-toml <path to this file>
+#
+# This file describes two PyDL graphs.
+# 
+# TOML-related notes:
+# - The following TOML content corresponds to a Python dictionary
+#   `{'graphs': [...]}`. Each `[[graph]]` denotes a new item in the list.
+# - Single quotes denote raw strings, i.e. same as r"..." in Python.
+# - Triple quotation marks (""" or ''') start/end a multiline string.
+# - To produce multiline strings from Python, use
+#   `tomli_w.dump(..., multiline_strings=True)`. 
+
+[[graphs]]
+comment = "TOML example (one command)"
+n_gpus = 1
+main_commands = "uv run bin/demo.py exp/examples/demo --force"
+
+[[graphs]]
+comment = "TOML example (multiple commands)"
+n_gpus = 1
+priority = "high"
+main_commands = '''
+echo Running the first experiment
+uv run bin/demo.py exp/examples/demo --force
+
+echo Running the second experiment
+uv run bin/demo.py exp/examples/demo --force
+'''

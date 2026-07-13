@@ -1,0 +1,16 @@
+[nirvana.run]
+# Data is likely to be the same for all users.
+# See the available data IDs in dev/lib/nirvana/run.py.
+# NOTE: make data_ids an empty list once the issue is resolved:
+# https://github.com/BrianPugh/cyclopts/issues/491
+data_ids = ["89e7ab8f-1441-4bd9-9707-ca62eb56ad79"]
+layer_id = "56d96d9c-557f-49e7-ad0e-349eafcb55d8"
+# The default number of CPU cores should be the same
+# for all users to ensure comparable runtimes.
+n_cpu_cores = 2
+quota = "yr-other"
+job_scheduler_instance = "watt"
+job_scheduler_yt_pool = "nirvana-yr-tabular"
+# The default GPU type should be the same
+# for all users to ensure comparable runtimes.
+pool_tree = ["gpu_tesla_a100_80g"]

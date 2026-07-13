@@ -1,0 +1,8 @@
+[nirvana.run]
+workflow_id = "TODO"
+pulsar_token_secret = "TODO"
+yt_token_secret = "TODO"
+ssh_key_secret = "TODO"
+
+[nirvana.download]
+log_path = "dev/users/{{ username }}/nirvana_download_log.json"
