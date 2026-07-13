@@ -175,9 +175,9 @@ local
 # Experiment files
 **/exp/**/*.*
 # Uncomment to track experiment files.
-# !**/exp/**/_RUNNING
-# !**/exp/**/config.toml
-# !**/exp/**/report.json
+!**/exp/**/_RUNNING
+!**/exp/**/config.toml
+!**/exp/**/report.json
 # exp/examples/demo/_RUNNING
 # exp/examples/demo/report.json
 

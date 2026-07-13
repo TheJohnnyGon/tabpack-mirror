@@ -1,0 +1,9 @@
+seed = 0
+test_size = 0.3
+
+[dataset]
+n_samples = 1000
+n_features = 10
+
+[model]
+C = 0.1

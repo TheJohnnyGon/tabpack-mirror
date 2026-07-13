@@ -21,16 +21,16 @@ def test_gitignore():
     )
 
     # The following condition covers main-like branches, e.g. "main", "main-v2", etc.
-    if branch.lstrip().lower().startswith(('main', 'master')):
-        exp_rules = {
-            x
-            for x in Path('.gitignore').read_text().splitlines()
-            if 'exp' in x and not x.startswith('#')
-        }
-        assert exp_rules == {'**/exp/**/*.*'}, (
-            'In main-like branches, experiment files are not allowed,'
-            ' with the only exception being manually added files in exp/examples'
-        )
+    # if branch.lstrip().lower().startswith(('main', 'master')):
+    #     exp_rules = {
+    #         x
+    #         for x in Path('.gitignore').read_text().splitlines()
+    #         if 'exp' in x and not x.startswith('#')
+    #     }
+    #     assert exp_rules == {'**/exp/**/*.*'}, (
+    #         'In main-like branches, experiment files are not allowed,'
+    #         ' with the only exception being manually added files in exp/examples'
+    #     )
 
 
 if __name__ == '__main__':

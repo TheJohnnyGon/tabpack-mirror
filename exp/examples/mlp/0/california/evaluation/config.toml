@@ -1,0 +1,24 @@
+function = "bin.mlp.main"
+n_seeds = 15
+
+[base_config]
+batch_size = 256
+n_epochs = -1
+patience = 16
+gradient_clipping_norm = 1.0
+
+[base_config.data]
+path = "data/california"
+extract_bin_from_num = true
+num_policy = "noisy-quantile"
+cache = true
+
+[base_config.model.backbone]
+n_blocks = 2
+d_block = 928
+dropout = 0.3709372304468528
+
+[base_config.optimizer]
+type = "AdamW"
+lr = 0.0009201256128837843
+weight_decay = 0.07328226260712786

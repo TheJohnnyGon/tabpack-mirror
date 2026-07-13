@@ -1,0 +1,8 @@
+[nirvana.run]
+workflow_id = "fb915185-0d94-4233-8974-4335cf69ba2e"
+pulsar_token_secret = "pulsar-secret-manual"
+yt_token_secret = "nirvana-yt-token-sergazinov"
+ssh_key_secret = "nirvana-private-github-key"
+
+[nirvana.download]
+log_path = "dev/users/sergazinov/nirvana_download_log.json"
