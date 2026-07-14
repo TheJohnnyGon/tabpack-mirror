@@ -1,6 +1,6 @@
 seed = 0
 n_models = 64
-batch_size = 256
+batch_size = 1024
 n_epochs = -1
 patience = 16
 amp_dtype = "bfloat16"
@@ -9,8 +9,7 @@ track_online_ensemble_history = true
 track_experiments = true
 
 [data]
-path = "data/churn"
-num_policy = "noisy-quantile"
+path = "data/tabred/cooking-time"
 extract_bin_from_num = true
 bin_policy = "convert-to-cat"
 cat_policy = "ordinal"
@@ -33,6 +32,9 @@ max_ensemble_size = 32
 activation = "ReLU"
 d_block = 384
 
+[model.num_embeddings]
+type = "CosineEmbeddingsPack"
+
 [sampler]
 type = "RandomSampler"
 
@@ -49,6 +51,21 @@ dropout = [
     0.0,
     0.0,
     0.5,
+]
+
+[sampler.space.model.num_embeddings]
+d_embedding = [
+    "_tune_",
+    "int",
+    8,
+    32,
+    4,
+]
+init_scale = [
+    "_tune_",
+    "loguniform",
+    0.01,
+    10.0,
 ]
 
 [sampler.space.optimizer]

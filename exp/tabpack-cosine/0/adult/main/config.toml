@@ -9,7 +9,7 @@ track_online_ensemble_history = true
 track_experiments = true
 
 [data]
-path = "data/churn"
+path = "data/adult"
 num_policy = "noisy-quantile"
 extract_bin_from_num = true
 bin_policy = "convert-to-cat"
@@ -33,6 +33,9 @@ max_ensemble_size = 32
 activation = "ReLU"
 d_block = 384
 
+[model.num_embeddings]
+type = "CosineEmbeddingsPack"
+
 [sampler]
 type = "RandomSampler"
 
@@ -49,6 +52,21 @@ dropout = [
     0.0,
     0.0,
     0.5,
+]
+
+[sampler.space.model.num_embeddings]
+d_embedding = [
+    "_tune_",
+    "int",
+    8,
+    32,
+    4,
+]
+init_scale = [
+    "_tune_",
+    "loguniform",
+    0.01,
+    10.0,
 ]
 
 [sampler.space.optimizer]

@@ -9,7 +9,7 @@ track_online_ensemble_history = true
 track_experiments = true
 
 [data]
-path = "data/churn"
+path = "data/tabred/sberbank-housing"
 num_policy = "noisy-quantile"
 extract_bin_from_num = true
 bin_policy = "convert-to-cat"
