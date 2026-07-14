@@ -184,8 +184,8 @@ parser.add_argument('--datasets', nargs='+', default=None,
                     help='Datasets to include (default: all discovered)')
 parser.add_argument('--ensemble', default='greedy',
                     help='Online ensemble name (default: greedy)')
-parser.add_argument('--csv', type=Path, default=None,
-                    help='Path to write CSV output (default: exp/../results.csv)')
+parser.add_argument('--tsv', type=Path, default=None,
+                    help='Path to write TSV output (default: exp/../results.tsv)')
 args = parser.parse_args()
 
 ensemble: str = args.ensemble
@@ -232,14 +232,14 @@ for variant, exp_dir in run_list:
         metric = metric_names.get(dataset, '?')
         for seed_idx, score in enumerate(scores):
             val = f'{score:.6f}' if score is not None else 'N/A'
-            all_csv_rows.append(f'{variant},{dataset},{seed_idx},{val},{metric}')
+            all_csv_rows.append(f'{variant}\t{dataset}\t{seed_idx}\t{val}\t{metric}')
 
-# ── write CSV ──────────────────────────────────────────────────────────────────
+# ── write TSV ──────────────────────────────────────────────────────────────────
 
-csv_path = args.csv or (BASE_DIR / 'exp' / 'results.csv')
-with open(csv_path, 'w', encoding='utf-8') as f:
-    f.write('variant,dataset,seed,test_score,metric\n')
+tsv_path = args.tsv or (BASE_DIR / 'exp' / 'results.tsv')
+with open(tsv_path, 'w', encoding='utf-8') as f:
+    f.write('variant\tdataset\tseed\ttest_score\tmetric\n')
     for row in all_csv_rows:
         f.write(row + '\n')
 
-print(f'\nCSV saved → {csv_path}')
+print(f'\nTSV saved → {tsv_path}')
