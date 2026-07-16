@@ -77,9 +77,10 @@ def load_tsv(path: Path) -> tuple[np.ndarray, np.ndarray]:
         on_bad_lines="warn",
     )[2].dropna()
 
-    # ── 2. Expand inner cols (literal r'\t' separator) ────────────────────────
-    # Result shape: (N, n_inner_cols)
-    inner = raw.str.split(r"\t", expand=True)
+    # ── 2. Expand inner cols (literal two-char \t separator) ─────────────────
+    # regex=False → treat the pattern as a plain string, not a regex
+    # (regex \t would match a real tab; we need literal backslash-t)
+    inner = raw.str.split(r"\t", expand=True, regex=False)
 
     n_inner = inner.shape[1]
     needed  = VCOL_FEAT_START + N_FEATURES  # 3 + 819 = 822
