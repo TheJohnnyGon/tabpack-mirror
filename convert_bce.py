@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from pathlib import Path
 
@@ -59,42 +60,45 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# After flattening, the column layout in the combined TSV is:
+#   flat col 0  : GroupId   (outer col 0)
+#   flat col 1  : subkey    (outer col 1)
+#   flat col 2  : label     (inner vcol 0)
+#   flat col 3  : JSON      (inner vcol 1)  – skip
+#   flat col 4  : weight    (inner vcol 2)  – skip
+#   flat col 5…823 : 819 FI_* features
+_FLAT_LABEL     = 2
+_FLAT_FEAT_START = 5
+_FLAT_FEAT_COLS = list(range(_FLAT_FEAT_START, _FLAT_FEAT_START + N_FEATURES))  # 5..823
+_USECOLS        = [_FLAT_LABEL] + _FLAT_FEAT_COLS                               # 820 cols
+
+
 def load_tsv(path: Path) -> tuple[np.ndarray, np.ndarray]:
     """Return (x_num float32 (N, 819), y int64 (N,)).
 
-    Fast path: pandas reads the outer TSV (only the 'value' column is needed),
-    then a vectorised str.split expands inner cols — no per-row Python loop.
+    Fastest path: one C-level bytes.replace turns the literal \\t inner
+    separator into a real tab, producing a flat TSV that pd.read_csv can
+    parse entirely in C with no Python loops.
     """
-    # ── 1. Read outer TSV; keep only the 'value' column (index 2) ────────────
-    # on_bad_lines='warn' skips malformed rows instead of crashing
-    raw: pd.Series = pd.read_csv(
-        path,
+    # ── 1. Read & flatten ─────────────────────────────────────────────────────
+    # Replace literal two-char sequence b'\\t' (0x5C 0x74) → real tab (0x09).
+    # After this the file is a plain tab-separated table with 824 columns.
+    data = path.read_bytes().replace(b"\\t", b"\t")
+
+    # ── 2. Single pd.read_csv pass in C ───────────────────────────────────────
+    df = pd.read_csv(
+        io.BytesIO(data),
         sep="\t",
         header=None,
-        usecols=[2],
-        dtype=str,
+        usecols=_USECOLS,       # read only label + 819 feat cols; skip the rest
+        dtype=np.float32,       # parse everything as float32 directly
         encoding="utf-8",
         on_bad_lines="warn",
-    )[2].dropna()
+    )
 
-    # ── 2. Expand inner cols (literal two-char \t separator) ─────────────────
-    # regex=False → treat the pattern as a plain string, not a regex
-    # (regex \t would match a real tab; we need literal backslash-t)
-    inner = raw.str.split(r"\t", expand=True, regex=False)
-
-    n_inner = inner.shape[1]
-    needed  = VCOL_FEAT_START + N_FEATURES  # 3 + 819 = 822
-    if n_inner < needed:
-        raise ValueError(
-            f"Expected ≥{needed} inner vcols, got {n_inner} in {path}"
-        )
-
-    # ── 3. Label (vcol 0) ─────────────────────────────────────────────────────
-    y = inner.iloc[:, VCOL_LABEL].astype(np.int64).to_numpy()
-
-    # ── 4. Features (vcols 3…821) ─────────────────────────────────────────────
-    feat_cols = inner.iloc[:, VCOL_FEAT_START: VCOL_FEAT_START + N_FEATURES]
-    x_num = feat_cols.to_numpy(dtype=np.float32)
+    # ── 3. Split label / features ─────────────────────────────────────────────
+    y     = df[_FLAT_LABEL].to_numpy(dtype=np.int64)
+    x_num = df[_FLAT_FEAT_COLS].to_numpy(dtype=np.float32)
 
     return x_num, y
 
