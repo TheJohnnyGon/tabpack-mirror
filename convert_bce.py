@@ -31,6 +31,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 # ── inner-value column positions (after splitting value by literal r'\\t') ────
 VCOL_LABEL      = 0    # binary click label (0 or 1)
@@ -59,51 +60,41 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_tsv(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Return (x_num float32 (N, 819), y int64 (N,))."""
-    xs: list[list[float]] = []
-    ys: list[int] = []
+    """Return (x_num float32 (N, 819), y int64 (N,)).
 
-    with path.open("r", encoding="utf-8") as f:
-        for lineno, line in enumerate(f, start=1):
-            line = line.rstrip("\n")
-            if not line:
-                continue
+    Fast path: pandas reads the outer TSV (only the 'value' column is needed),
+    then a vectorised str.split expands inner cols — no per-row Python loop.
+    """
+    # ── 1. Read outer TSV; keep only the 'value' column (index 2) ────────────
+    # on_bad_lines='warn' skips malformed rows instead of crashing
+    raw: pd.Series = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        usecols=[2],
+        dtype=str,
+        encoding="utf-8",
+        on_bad_lines="warn",
+    )[2].dropna()
 
-            # outer split by real tab → [GroupId, subkey, value]
-            outer = line.split("\t")
-            if len(outer) < 3:
-                raise ValueError(
-                    f"Line {lineno}: expected ≥3 outer tab-cols, got {len(outer)}"
-                )
+    # ── 2. Expand inner cols (literal r'\t' separator) ────────────────────────
+    # Result shape: (N, n_inner_cols)
+    inner = raw.str.split(r"\t", expand=True)
 
-            # inner split by literal backslash-t
-            vcols = outer[2].split(r"\t")
+    n_inner = inner.shape[1]
+    needed  = VCOL_FEAT_START + N_FEATURES  # 3 + 819 = 822
+    if n_inner < needed:
+        raise ValueError(
+            f"Expected ≥{needed} inner vcols, got {n_inner} in {path}"
+        )
 
-            # ── label ──────────────────────────────────────────────────────
-            try:
-                label = int(vcols[VCOL_LABEL])
-            except (IndexError, ValueError) as e:
-                raise ValueError(
-                    f"Line {lineno}: cannot parse label at vcol {VCOL_LABEL}: {e!r}"
-                )
+    # ── 3. Label (vcol 0) ─────────────────────────────────────────────────────
+    y = inner.iloc[:, VCOL_LABEL].astype(np.int64).to_numpy()
 
-            # ── features ───────────────────────────────────────────────────
-            feat_vcols = vcols[VCOL_FEAT_START: VCOL_FEAT_START + N_FEATURES]
-            if len(feat_vcols) < N_FEATURES:
-                raise ValueError(
-                    f"Line {lineno}: expected {N_FEATURES} feature vcols, "
-                    f"got {len(feat_vcols)} (total vcols={len(vcols)})"
-                )
-            try:
-                feats = [float(v) for v in feat_vcols]
-            except ValueError as e:
-                raise ValueError(f"Line {lineno}: cannot parse feature: {e!r}")
+    # ── 4. Features (vcols 3…821) ─────────────────────────────────────────────
+    feat_cols = inner.iloc[:, VCOL_FEAT_START: VCOL_FEAT_START + N_FEATURES]
+    x_num = feat_cols.to_numpy(dtype=np.float32)
 
-            ys.append(label)
-            xs.append(feats)
-
-    x_num = np.array(xs, dtype=np.float32)
-    y     = np.array(ys, dtype=np.int64)
     return x_num, y
 
 
