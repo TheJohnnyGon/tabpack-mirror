@@ -1165,6 +1165,7 @@ class Config(TypedDict):
     # Output
     save_final_predictions: NotRequired[bool]
     save_all_predictions: NotRequired[bool]
+    save_model: NotRequired[bool]
 
 
 def _validate_config(config: Config) -> None:
@@ -1357,19 +1358,21 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     logger.debug('Transposed the configs')
 
     # >>> Model
+    cat_cardinalities = dataset.compute_cat_cardinalities()
+    resolved_model_config = _prepare_model_config(
+        config,
+        (
+            None
+            if configs_T is None or 'model' not in configs_T
+            else bin.tabpack.utils.transpose_list_of_dicts(configs_T.pop('model'))
+        ),
+    )
     model = ModelPack(
         n_num_features=dataset.n_num_features,
-        cat_cardinalities=dataset.compute_cat_cardinalities(),
+        cat_cardinalities=cat_cardinalities,
         n_classes=n_classes,
         pack_size=state.pack_size,
-        **_prepare_model_config(
-            config,
-            (
-                None
-                if configs_T is None or 'model' not in configs_T
-                else bin.tabpack.utils.transpose_list_of_dicts(configs_T.pop('model'))
-            ),
-        ),
+        **resolved_model_config,
     )
     logger.debug('Created the model')
     model.to(device)
@@ -1462,6 +1465,11 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     step = 0
     batch_generator = torch.Generator(device).manual_seed(config['seed'])
     experiments: list[ExperimentDict] = []
+    # When `save_model` is enabled, the best checkpoint of every finished pack
+    # member is collected here (keyed by its id) right before the member is
+    # removed from the pack, and dumped to `model.pt` after training.
+    save_model = config.get('save_model', False)
+    saved_model_state_dicts: dict[int, dict[str, Tensor]] = {}
     online_ensemble_predictions: None | dict[str, dict[PartKey, np.ndarray]] = (
         None
         if online_ensembles is None
@@ -1679,6 +1687,21 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                         get_experiment_val_score(experiment),
                     )
 
+            # Collect the best checkpoints of the stopped members before they are
+            # removed from the pack (their weights are lost after `pack_remove`).
+            # The pack dimension (size 1) is retained so that the weights can be
+            # loaded back into a rebuilt full-size pack via
+            # `bin.tabpack.nn.module_pack_load_state_dict`.
+            if save_model:
+                for i in map(int, stop_pack_idx):
+                    member_id = int(state.ids[i])
+                    saved_model_state_dicts[member_id] = {
+                        name: value[i : i + 1].detach().cpu().clone()
+                        for name, value in state.best_model_state_dicts.items()
+                    }
+                    del member_id
+                del i
+
             # Remove the stopped models.
             pack_remove(model, optimizer, state, pack_idx=stop_pack_idx)
 
@@ -1857,6 +1880,31 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     if config.get('save_final_predictions', True):
         np.savez(exp / 'predictions.npz', **final_state.predictions)  # type: ignore
+
+    # Dump a self-contained model artifact for standalone inference.
+    # It bundles the best weights of every finished member (keyed by id) together
+    # with everything needed to rebuild `ModelPack` and reproduce the data
+    # preprocessing outside of this script.
+    if save_model:
+        torch.save(
+            {
+                'state_dicts': saved_model_state_dicts,
+                'n_models': config['n_models'],
+                'model_config': resolved_model_config,
+                'configs': all_configs,
+                'n_num_features': dataset.n_num_features,
+                'cat_cardinalities': cat_cardinalities,
+                'n_classes': n_classes,
+                'prediction_type': prediction_type.value,
+                'regression_label_stats': (
+                    None
+                    if regression_label_stats is None
+                    else dataclasses.asdict(regression_label_stats)
+                ),
+                'data_config': config['data'],
+            },
+            exp / 'model.pt',
+        )
 
     if online_ensemble_predictions is not None:
         assert online_ensemble_history is not None
