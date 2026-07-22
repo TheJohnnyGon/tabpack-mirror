@@ -202,7 +202,11 @@ def load_clean(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols):
         na_values=list(NA_STRINGS), keep_default_na=True)
     row = row0
     memo: dict = {}
-    for chunk in reader:
+    # Count total chunks upfront for progress display
+    total_rows = count_rows(path)
+    total_chunks = (total_rows + CHUNK_ROWS - 1) // CHUNK_ROWS
+    print(f"  Chunks: {total_chunks} (~{CHUNK_ROWS:,} rows/chunk)")
+    for chunk_idx, chunk in enumerate(reader, 1):
         n = len(chunk)
         sl = slice(row, row + n)
         labels = chunk[1].to_numpy(np.float64)
@@ -215,6 +219,7 @@ def load_clean(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols):
         if col_cat:
             x_cat.extend(chunk[col_cat].astype(str).to_numpy().tolist())
         row += n
+        print(f"  chunk {chunk_idx}/{total_chunks} ({row - row0:,} rows)")
     return row - row0
 
 
@@ -298,6 +303,7 @@ def main() -> None:
     # ── convert ──────────────────────────────────────────────────────────────
     row, offsets = 0, {}
     for name, path in splits:
+        print(f"Loading {name} ({counts[name]:,} rows)...")
         loader = load_clean if layouts[name] == "clean" else load_raw
         n = loader(path, row, x_num, x_cat, ys, keys, num_cols, cat_cols)
         if n != counts[name]:
@@ -311,7 +317,9 @@ def main() -> None:
     y_dtype = np.float32 if args.task_type == "regression" else np.int64
     y = ys.astype(y_dtype)
     np.save(args.out_dir / "y.npy", y)
-    np.save(args.out_dir / "key.npy", keys)
+    # int64 view (bit-reinterpret): torch.as_tensor does not support uint64,
+    # and lib.data.load_data picks up every *.npy file in the dataset dir.
+    np.save(args.out_dir / "key.npy", keys.view(np.int64))
     if len(cat_cols):
         np.save(args.out_dir / "x_cat.npy", np.array(x_cat, dtype=np.str_))
 
@@ -327,7 +335,7 @@ def main() -> None:
     print(f"  x_num.npy {x_num.shape} float32")
     if len(cat_cols):
         print(f"  x_cat.npy ({n_total}, {len(cat_cols)}) str")
-    print(f"  y.npy {y.shape} {y.dtype}, key.npy uint64, info.json, "
+    print(f"  y.npy {y.shape} {y.dtype}, key.npy int64, info.json, "
           f"splits/default/{{{', '.join(n for n, _ in splits)}}}.npy")
     if args.task_type != "regression":
         uniq, cnt = np.unique(y, return_counts=True)
