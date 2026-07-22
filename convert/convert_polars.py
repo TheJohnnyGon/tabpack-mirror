@@ -56,12 +56,13 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 
-CHUNK_ROWS = 200_000  # rows per polars batch
+CHUNK_ROWS = 500_000  # rows per polars batch
 
 # raw layout: value-field columns (split by literal backslash-t)
 RAW_VCOL_LABEL = 0
@@ -92,8 +93,6 @@ def parse_args() -> argparse.Namespace:
                    help='Spec string "11:21-23:26" or path to a file with it '
                         "(0-based FEATURE indices, ranges inclusive, clipped)")
     p.add_argument("--task-type", choices=sorted(TASK_SCORES), default="binclass")
-    p.add_argument("--streaming", action="store_true",
-                   help="Use polars streaming mode for lower memory usage")
     p.add_argument("--n-workers", type=int, default=os.cpu_count(),
                    help="Number of workers for polars (default: all CPUs)")
     args = p.parse_args()
@@ -187,7 +186,9 @@ def sniff(path: Path):
 
 
 def hash_keys_vec(raw_keys: np.ndarray, memo: dict) -> np.ndarray:
-    """Vectorized-ish key hashing: hash each unique key once per chunk."""
+    """Vectorized-ish key hashing: hash each unique key once (across the
+    whole array passed in, not per-chunk — call this once per file for
+    best performance)."""
     # Use numpy unique for better performance than pd.factorize
     uniques, codes = np.unique(raw_keys, return_inverse=True)
     # Hash unique keys
@@ -207,139 +208,101 @@ def load_clean_polars(
     keys: np.ndarray,
     num_cols: np.ndarray,
     cat_cols: np.ndarray,
-    streaming: bool = False,
+    n_features: int,
     n_workers: int = 1,
 ):
-    """Polars-based vectorized loader for clean layout. Returns rows written."""
+    """Polars-based vectorized loader for clean layout. Returns rows written.
+
+    Fully vectorized: no per-chunk Python loop. The whole file is read once
+    by polars (multi-threaded), then every output array is filled with a
+    single bulk numpy operation instead of looping over row-chunks.
+    """
     col_num = [2 + int(i) for i in num_cols]
     col_cat = [2 + int(i) for i in cat_cols]
-    all_cols = [0, 1] + col_num + col_cat
-    
-    # Build schema for polars
-    schema = {}
-    for c in all_cols:
-        schema[f"column_{c}"] = None  # let polars infer
-    
-    # Polars column names (it auto-generates column_0, column_1, etc. for headerless)
-    col_num_names = [f"column_{c}" for c in col_num]
-    col_cat_names = [f"column_{c}" for c in col_cat]
-    
+    cat_set = set(col_cat)
+
+    # IMPORTANT: polars names headerless columns column_1, column_2, ...
+    # (1-based!), not column_0. So a 0-based file column index `c` maps to
+    # polars column name f"column_{c + 1}".
+    col_num_names = [f"column_{c + 1}" for c in col_num]
+    col_cat_names = [f"column_{c + 1}" for c in col_cat]
+    key_col_name = "column_1"   # file column 0 = key
+    label_col_name = "column_2"  # file column 1 = label
+
+    # Schema overrides MUST cover every column in the file, including the
+    # ones we are going to drop (ignored features) — otherwise polars infers
+    # their type from a small sample and blows up later if e.g. a column
+    # looks like ints in the first rows but has floats further down.
+    # File layout: 0=key, 1=label, 2..2+n_features-1=features.
+    schema_overrides = {key_col_name: pl.String, label_col_name: pl.Float64}
+    for feat_idx in range(n_features):
+        c = 2 + feat_idx  # 0-based file column index for this feature
+        schema_overrides[f"column_{c + 1}"] = pl.String if c in cat_set else pl.Float32
+
     null_values = list(NA_STRINGS)
-    
-    row = row0
     memo: dict = {}
-    
-    # Count total rows for progress
-    total_rows = count_rows(path)
-    
-    print(f"  Total rows: {total_rows:,}, workers: {n_workers}")
-    
-    if streaming:
-        # Streaming mode: process in batches with low memory
-        chunks_processed = 0
-        lazy_frame = pl.scan_csv(
-            str(path),
-            separator="\t",
-            has_header=False,
-            try_parse_dates=False,
-            null_values=null_values,
-            n_threads=n_workers,
-        )
-        
-        # Collect in batches using sink_batch_batches (polars >= 0.20)
-        # Fallback to regular streaming collect
-        stream = lazy_frame.collect_streaming(engine=pl.StreamingEngine(polars_prefilter=True))
-        
-        # Process the streamed dataframe in chunks
-        # For simplicity, we'll use iter_slices if available, otherwise collect
-        try:
-            for batch in stream.iter_chunks(chunk_size=CHUNK_ROWS):
-                chunks_processed += 1
-                n = len(batch)
-                sl = slice(row, row + n)
-                
-                # Extract label column
-                labels = batch[1].to_numpy(dtype=np.float64)
-                if np.isnan(labels).any():
-                    bad_idx = np.flatnonzero(np.isnan(labels))[0]
-                    bad = row - row0 + int(bad_idx) + 1
-                    sys.exit(f"error: {path} row {bad}: label is null/missing — почини YQL")
-                ys[sl] = labels
-                
-                # Hash keys
-                raw_keys = batch[0].cast(pl.String).to_numpy()
-                keys[sl] = hash_keys_vec(raw_keys, memo)
-                
-                # Numeric features
-                for i, col_name in enumerate(col_num_names):
-                    x_num[sl, i] = batch[col_name].to_numpy(dtype=np.float32)
-                
-                # Categorical features
-                if col_cat_names:
-                    cat_row = []
-                    for col_name in col_cat_names:
-                        vals = batch[col_name].cast(pl.String).to_list()
-                        cat_row.extend(vals)
-                    # Transpose to get rows
-                    for r in range(n):
-                        x_cat.append([cat_row[i * n + r] for i in range(len(col_cat_names))])
-                
-                row += n
-                print(f"  batch {chunks_processed} ({row - row0:,} rows)")
-        except AttributeError:
-            # Fallback for older polars versions
-            df = lazy_frame.collect(streaming=True)
-            _process_polars_df(df, path, row0, x_num, x_cat, ys, keys, 
-                              col_num_names, col_cat_names, row, memo)
-            row += len(df)
-    else:
-        # Non-streaming: collect in batches using read_csv_batched or chunked
-        chunks_processed = 0
-        
-        # Use read_csv with rechunk for better performance
-        reader = pl.read_csv(
-            str(path),
-            separator="\t",
-            has_header=False,
-            try_parse_dates=False,
-            null_values=null_values,
-            n_threads=n_workers,
-            low_memory=False,
-        )
-        
-        # Process in chunks manually
-        for start in range(0, len(reader), CHUNK_ROWS):
-            chunks_processed += 1
-            chunk = reader.slice(start, CHUNK_ROWS)
-            n = len(chunk)
-            sl = slice(row, row + n)
-            
-            # Extract label column
-            labels = chunk[1].to_numpy(dtype=np.float64)
-            if np.isnan(labels).any():
-                bad_idx = np.flatnonzero(np.isnan(labels))[0]
-                bad = row - row0 + int(bad_idx) + 1
-                sys.exit(f"error: {path} row {bad}: label is null/missing — почини YQL")
-            ys[sl] = labels
-            
-            # Hash keys
-            raw_keys = chunk[0].cast(pl.String).to_numpy()
-            keys[sl] = hash_keys_vec(raw_keys, memo)
-            
-            # Numeric features
-            for i, col_name in enumerate(col_num_names):
-                x_num[sl, i] = chunk[col_name].to_numpy(dtype=np.float32)
-            
-            # Categorical features
-            if col_cat_names:
-                for r in range(n):
-                    cat_vals = [chunk[col_name][r] for col_name in col_cat_names]
-                    x_cat.append([str(v) if v is not None else "" for v in cat_vals])
-            
-            row += n
-            print(f"  chunk {chunks_processed} ({row - row0:,} rows)")
-    
-    return row - row0
+
+    # ── Read the whole file with polars (multi-threaded) ──────────────
+    # Reading all columns is faster than selecting subset because polars
+    # parses the whole line anyway; dropping columns after is cheap.
+    _t0 = time.perf_counter()
+    df = pl.read_csv(
+        str(path),
+        separator="\t",
+        has_header=False,
+        try_parse_dates=False,
+        null_values=null_values,
+        n_threads=n_workers,
+        schema_overrides=schema_overrides,
+        comment_prefix=None,
+    )
+    n = len(df)
+    _t1 = time.perf_counter()
+    print(f"  Rows: {n:,}, workers: {n_workers}")
+    print(f"  [profile] pl.read_csv: {_t1 - _t0:.2f}s")
+
+    sl = slice(row0, row0 + n)
+
+    # ── Labels: one bulk conversion ────────────────────────────────────
+    _s = time.perf_counter()
+    labels = df[label_col_name].to_numpy().astype(np.float64)
+    if np.isnan(labels).any():
+        bad = int(np.flatnonzero(np.isnan(labels))[0]) + 1
+        sys.exit(f"error: {path} row {bad}: label is null/missing — почини YQL")
+    ys[sl] = labels
+    _t_labels = time.perf_counter() - _s
+
+    # ── Keys: one bulk hash pass over unique values ────────────────────
+    _s = time.perf_counter()
+    raw_keys = df[key_col_name].to_numpy()
+    keys[sl] = hash_keys_vec(raw_keys, memo)
+    _t_keys = time.perf_counter() - _s
+
+    # ── Numeric features: single 2D bulk conversion, no per-column loop ─
+    _s = time.perf_counter()
+    if col_num_names:
+        # df.select(...).to_numpy() on a uniformly-typed (Float32) frame
+        # returns one contiguous 2D array — a single vectorized memcpy
+        # instead of 370 separate per-column calls.
+        x_num[sl, :] = df.select(col_num_names).to_numpy().astype(np.float32)
+    _t_numfeat = time.perf_counter() - _s
+
+    # ── Categorical features: bulk-extract columns, then zip into rows ──
+    _s = time.perf_counter()
+    if col_cat_names:
+        cat_cols_data = [
+            df[col_name].cast(pl.String).fill_null("").to_list()
+            for col_name in col_cat_names
+        ]
+        x_cat.extend(list(row_vals) for row_vals in zip(*cat_cols_data))
+    _t_catfeat = time.perf_counter() - _s
+
+    print(f"  [profile] labels: {_t_labels:.2f}s, keys(hash): {_t_keys:.2f}s, "
+          f"num_features(bulk write): {_t_numfeat:.2f}s, cat_features: {_t_catfeat:.2f}s")
+    print(f"  [profile] TOTAL post-read processing: "
+          f"{_t_labels + _t_keys + _t_numfeat + _t_catfeat:.2f}s")
+
+    return n
 
 
 def load_raw(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols):
@@ -442,10 +405,8 @@ def main() -> None:
         print(f"Loading {name} ({counts[name]:,} rows)...")
         loader = load_clean_polars if layouts[name] == "clean" else load_raw
         if layouts[name] == "clean":
-            n = loader(
-                path, row, x_num, x_cat, ys, keys, num_cols, cat_cols,
-                streaming=args.streaming, n_workers=args.n_workers or 1,
-            )
+            n = loader(path, row, x_num, x_cat, ys, keys, num_cols, cat_cols,
+                       n_features, n_workers=args.n_workers or 1)
         else:
             n = loader(path, row, x_num, x_cat, ys, keys, num_cols, cat_cols)
         if n != counts[name]:
