@@ -428,10 +428,20 @@ def run_cli[T](function: MainFunction[T], *, resumable: bool = False) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('exp', metavar='PATH')
     parser.add_argument('--force', action='store_true')
+    parser.add_argument(
+        '--ddp', action='store_true',
+        help='Enable multi-GPU training via DistributedDataParallel (DDP). '
+             'Automatically detects available GPUs and launches one process per GPU.',
+    )
     if resumable:
         parser.add_argument('--resume', action='store_true')
 
-    run(function, None, **vars(parser.parse_args(sys.argv[1:])))
+    args = vars(parser.parse_args(sys.argv[1:]))
+    # --ddp is handled in the __main__ block before run_cli is called,
+    # but keep it in the parser for --help visibility.
+    args.pop('ddp', None)
+
+    run(function, None, **args)
 
 
 # ======================================================================================

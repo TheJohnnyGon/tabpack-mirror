@@ -1296,6 +1296,11 @@ def _prepare_model_config(
 def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     _validate_config(config)
 
+    # >>> Distributed init (must be before any CUDA op)
+    lib.util.init_distributed()
+    distributed = lib.util.is_distributed()
+    local_rank = lib.util.get_local_rank()
+
     # >>> Start
     exp = Path(exp)
     report = lib.experiment.create_report(main, add_gpu_info=True)
@@ -1376,6 +1381,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     logger.debug('Created the model')
     model.to(device)
+
+    # Wrap in DDP for multi-GPU training.
+    if distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank
+        )
+        logger.info(f'Wrapped model in DDP (rank={local_rank})')
+
     logger.debug('Moved the model to the device')
 
     # NOTE
@@ -1719,8 +1732,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 )
             report['time'] = timer.elapsed()
 
-            # Make the update visible.
-            lib.experiment.dump_report(exp, report)
+            # Make the update visible (only on main process in DDP).
+            if lib.util.is_main_process():
+                lib.experiment.dump_report(exp, report)
 
             del final_predictions, final_predictions_torch
             _free_mps_memory()
@@ -1842,113 +1856,148 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     pack_validate(model, optimizer, state)
     report['time'] = timer.elapsed()
 
-    # >>> Main artifacts
-    lib.experiment.dump_checkpoint(
-        exp,
-        {
-            'report': report,
-            'step': step,
-            'random_state': delu.random.get_state(),
-            'batch_generator': batch_generator.get_state(),
-            'hyperparameter_sampler': hyperparameter_sampler,
-            'timer': timer,
-        },
-    )
-
-    # NOTE
-    # The order of values in pack-related artifacts follows the order of finishing,
-    # NOT the order of IDs.
-
-    # Patch experiments to include all configs (even for unfinished models)
-    experiments_with_all_configs = []
-    for model_id in range(config['n_models']):
-        # Try to find finished experiment with this ID
-        finished_experiment = next(
-            (exp for exp in experiments if exp['report']['id'] == model_id), None
-        )
-
-        if finished_experiment is not None:
-            experiments_with_all_configs.append(finished_experiment)
-        else:
-            experiment = {}
-            if all_configs is not None:
-                experiment['config'] = all_configs[model_id]
-            experiments_with_all_configs.append(experiment)
-
-    exp.joinpath('experiments.json').write_text(
-        json.dumps(experiments_with_all_configs, indent=4)
-    )
-    if config.get('save_final_predictions', True):
-        np.savez(exp / 'predictions.npz', **final_state.predictions)  # type: ignore
-
-    # Dump a self-contained model artifact for standalone inference.
-    # It bundles the best weights of every finished member (keyed by id) together
-    # with everything needed to rebuild `ModelPack` and reproduce the data
-    # preprocessing outside of this script.
-    if save_model:
-        torch.save(
+    # >>> Main artifacts (only rank 0 writes files in DDP mode)
+    if lib.util.is_main_process():
+        lib.experiment.dump_checkpoint(
+            exp,
             {
-                'state_dicts': saved_model_state_dicts,
-                'n_models': config['n_models'],
-                'model_config': resolved_model_config,
-                'configs': all_configs,
-                'n_num_features': dataset.n_num_features,
-                'cat_cardinalities': cat_cardinalities,
-                'n_classes': n_classes,
-                'prediction_type': prediction_type.value,
-                'regression_label_stats': (
-                    None
-                    if regression_label_stats is None
-                    else dataclasses.asdict(regression_label_stats)
-                ),
-                'data_config': config['data'],
+                'report': report,
+                'step': step,
+                'random_state': delu.random.get_state(),
+                'batch_generator': batch_generator.get_state(),
+                'hyperparameter_sampler': hyperparameter_sampler,
+                'timer': timer,
             },
-            exp / 'model.pt',
         )
 
-    if online_ensemble_predictions is not None:
-        assert online_ensemble_history is not None
+        # NOTE
+        # The order of values in pack-related artifacts follows the order of finishing,
+        # NOT the order of IDs.
+
+        # Patch experiments to include all configs (even for unfinished models)
+        experiments_with_all_configs = []
+        for model_id in range(config['n_models']):
+            # Try to find finished experiment with this ID
+            finished_experiment = next(
+                (exp for exp in experiments if exp['report']['id'] == model_id), None
+            )
+
+            if finished_experiment is not None:
+                experiments_with_all_configs.append(finished_experiment)
+            else:
+                experiment = {}
+                if all_configs is not None:
+                    experiment['config'] = all_configs[model_id]
+                experiments_with_all_configs.append(experiment)
+
+        exp.joinpath('experiments.json').write_text(
+            json.dumps(experiments_with_all_configs, indent=4)
+        )
+        if config.get('save_final_predictions', True):
+            np.savez(exp / 'predictions.npz', **final_state.predictions)  # type: ignore
+
+        # Dump a self-contained model artifact for standalone inference.
+        # It bundles the best weights of every finished member (keyed by id) together
+        # with everything needed to rebuild `ModelPack` and reproduce the data
+        # preprocessing outside of this script.
+        if save_model:
+            torch.save(
+                {
+                    'state_dicts': saved_model_state_dicts,
+                    'n_models': config['n_models'],
+                    'model_config': resolved_model_config,
+                    'configs': all_configs,
+                    'n_num_features': dataset.n_num_features,
+                    'cat_cardinalities': cat_cardinalities,
+                    'n_classes': n_classes,
+                    'prediction_type': prediction_type.value,
+                    'regression_label_stats': (
+                        None
+                        if regression_label_stats is None
+                        else dataclasses.asdict(regression_label_stats)
+                    ),
+                    'data_config': config['data'],
+                },
+                exp / 'model.pt',
+            )
+
+        if online_ensemble_predictions is not None:
+            assert online_ensemble_history is not None
+            np.savez(
+                exp / 'online_ensemble_predictions.npz',
+                **lib.util.flatten_dict(
+                    {str(i): x for i, x in enumerate(online_ensemble_predictions)}
+                ),
+            )
+            exp.joinpath('online_ensemble_history.json').write_text(
+                json.dumps(online_ensemble_history, indent=4)
+            )
+
+        # >>> Save numerical logs
         np.savez(
-            exp / 'online_ensemble_predictions.npz',
+            exp / 'numlog.npz',
             **lib.util.flatten_dict(
-                {str(i): x for i, x in enumerate(online_ensemble_predictions)}
+                {
+                    'steps': bin.tabpack.utils.numpy_stack(
+                        bin.tabpack.utils.to_numpy(steps_numlog)  # type: ignore
+                    ),
+                    'epochs': bin.tabpack.utils.numpy_stack(
+                        bin.tabpack.utils.to_numpy(epochs_numlog)  # type: ignore
+                    ),
+                    'pack': {
+                        'epochs': bin.tabpack.utils.numpy_concatenate(pack_epochs_numlog),
+                    },
+                }
             ),
         )
-        exp.joinpath('online_ensemble_history.json').write_text(
-            json.dumps(online_ensemble_history, indent=4)
-        )
 
-    # >>> Save numerical logs
-    np.savez(
-        exp / 'numlog.npz',
-        **lib.util.flatten_dict(
-            {
-                'steps': bin.tabpack.utils.numpy_stack(
-                    bin.tabpack.utils.to_numpy(steps_numlog)  # type: ignore
-                ),
-                'epochs': bin.tabpack.utils.numpy_stack(
-                    bin.tabpack.utils.to_numpy(epochs_numlog)  # type: ignore
-                ),
-                'pack': {
-                    'epochs': bin.tabpack.utils.numpy_concatenate(pack_epochs_numlog),
-                },
-            }
-        ),
-    )
+        # If there is exactly one online ensemble, expose its metrics as the report's
+        # top-level metrics, so that the mean/std summaries of `bin.evaluate.main`
+        # and other downstream tools work with TabPack reports.
+        if online_ensembles is not None and len(report['online_ensembles']) == 1:
+            ensemble_report = next(iter(report['online_ensembles'].values()))['report']
+            if 'metrics' in ensemble_report:
+                report['metrics'] = ensemble_report['metrics']
 
-    # If there is exactly one online ensemble, expose its metrics as the report's
-    # top-level metrics, so that the mean/std summaries of `bin.evaluate.main`
-    # and other downstream tools work with TabPack reports.
-    if online_ensembles is not None and len(report['online_ensembles']) == 1:
-        ensemble_report = next(iter(report['online_ensembles'].values()))['report']
-        if 'metrics' in ensemble_report:
-            report['metrics'] = ensemble_report['metrics']
+        # >>> Finish
+        lib.experiment.finish(exp, report)
 
-    # >>> Finish
-    lib.experiment.finish(exp, report)
+    # Cleanup distributed group.
+    if distributed:
+        lib.util.cleanup_distributed()
+
     return report
 
 
 if __name__ == '__main__':
+    import sys
+
+    # Check for --ddp flag before any init.
+    ddp_flag = '--ddp' in sys.argv
+    if ddp_flag:
+        sys.argv.remove('--ddp')
+
+    if ddp_flag:
+        # Self-launch via torch.distributed.run (torchrun).
+        # Count available GPUs and spawn one process per GPU.
+        import subprocess
+
+        import torch
+
+        n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        if n_gpus < 2:
+            print(f'Warning: only {n_gpus} GPU(s) available, running without DDP')
+        else:
+            print(f'Launching DDP with {n_gpus} GPU(s)...')
+            script_path = Path(__file__).resolve()
+            python = sys.executable or 'python'
+            cmd = [
+                python, '-m', 'torch.distributed.run',
+                '--nproc_per_node', str(n_gpus),
+                '--standalone',
+                str(script_path),
+            ] + sys.argv[1:]
+            raise SystemExit(subprocess.call(cmd))
+
     lib.util.init()
     lib.experiment.run_cli(main)

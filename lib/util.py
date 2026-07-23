@@ -352,11 +352,77 @@ def get_function_full_name(function: Callable) -> str:
     return f'{module_full_name}.{function.__name__}'  # ty:ignore[unresolved-attribute]
 
 
+# -------------------------------------------------------------------
+# Distributed training state
+# -------------------------------------------------------------------
+_distributed_initialized: bool = False
+
+
+def is_distributed() -> bool:
+    """Check if distributed training is active."""
+    return _distributed_initialized
+
+
+def get_local_rank() -> int:
+    """Return the local GPU rank (0 when not distributed)."""
+    if not _distributed_initialized:
+        return 0
+    import torch.distributed as dist
+
+    return dist.get_rank()
+
+
+def get_world_size() -> int:
+    """Return the number of processes (1 when not distributed)."""
+    if not _distributed_initialized:
+        return 1
+    import torch.distributed as dist
+
+    return dist.get_world_size()
+
+
+def is_main_process() -> bool:
+    """Return True only for rank 0 (always True when not distributed)."""
+    return get_local_rank() == 0
+
+
+def init_distributed() -> None:
+    """Initialize PyTorch distributed (NCCL backend).
+
+    Must be called *before* any CUDA operation.
+    """
+    global _distributed_initialized
+    import torch.distributed as dist
+
+    if _distributed_initialized:
+        return
+
+    # torchrun / elastic sets these env vars automatically
+    if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
+        return  # not launched by torchrun — skip
+
+    dist.init_process_group(backend='nccl')
+    _distributed_initialized = True
+
+
+def cleanup_distributed() -> None:
+    """Destroy the distributed process group."""
+    global _distributed_initialized
+    if _distributed_initialized:
+        import torch.distributed as dist
+
+        dist.destroy_process_group()
+        _distributed_initialized = False
+
+
 def get_device():  # -> torch.device
     import torch
 
+    # In distributed mode each process uses its own GPU.
+    local_rank = get_local_rank()
+
     return torch.device(
-        'cuda:0'
+        f'cuda:{local_rank}'
         if torch.cuda.is_available()
         # MPS is opt-in: some operations used by the models are not implemented for
         # MPS, so PyTorch must be explicitly allowed to fall back to CPU for them.
