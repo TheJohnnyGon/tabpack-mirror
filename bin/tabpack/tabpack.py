@@ -1382,6 +1382,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     logger.debug('Created the model')
     model.to(device)
 
+    # Keep a reference to the unwrapped model for attribute access
+    # (DDP wrapper hides attributes like .backbone, .pack_size under .module).
+    raw_model = model
+
     # Wrap in DDP for multi-GPU training.
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -1423,7 +1427,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 'muon': True,
                 'muon_scale': _make_muon_scale(block.linear),
             }
-            for block in model.backbone._iter_blocks()
+            for block in raw_model.backbone._iter_blocks()
         ]
         if config['optimizer']['type'] == 'MuonAdamWPack'
         else []
@@ -1434,7 +1438,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             _default_zero_weight_decay_condition,
             custom_groups=muon_optimizer_parameter_groups,
         ),
-        pack_size=model.pack_size,
+        pack_size=raw_model.pack_size,
         **config['optimizer'],  # type: ignore
         **(
             {}
@@ -1534,7 +1538,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # >>> Training loop
     print()
     timer.run()
-    pack_validate(model, optimizer, state)
+    pack_validate(raw_model, optimizer, state)
 
     logger.debug('Starting the training loop')
     while (
@@ -1547,7 +1551,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     ):
         # >>> Validation
         n_remaining_models = config['n_models'] - report['n_models']
-        assert model.pack_size <= n_remaining_models
+        assert raw_model.pack_size <= n_remaining_models
 
         # >>> Training phase
         epoch_training_start_time = time.perf_counter()
@@ -1636,7 +1640,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         )
 
         # Determine which models to stop.
-        pack_size_before_stopping = model.pack_size
+        pack_size_before_stopping = raw_model.pack_size
         stop_pack_idx = compute_stop_pack_idx(
             state,
             epoch_size=epoch_size,
@@ -1670,9 +1674,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
 
             # Evaluate the best checkpoints of the stopped models.
             bin.tabpack.nn.module_pack_load_state_dict(
-                model, state.best_model_state_dicts, pack_idx=stop_pack_idx_torch
+                raw_model, state.best_model_state_dicts, pack_idx=stop_pack_idx_torch
             )
-            with bin.tabpack.nn.module_pack_select(model, stop_pack_idx_torch):
+            with bin.tabpack.nn.module_pack_select(raw_model, stop_pack_idx_torch):
                 (
                     (final_metrics, final_predictions, final_predictions_torch),
                     eval_batch_size,
@@ -1716,7 +1720,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 del i
 
             # Remove the stopped models.
-            pack_remove(model, optimizer, state, pack_idx=stop_pack_idx)
+            pack_remove(raw_model, optimizer, state, pack_idx=stop_pack_idx)
 
             # After the removal, all existing pack indices become invalid.
             del stop_pack_idx
@@ -1851,9 +1855,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         del epoch_evaluation_duration
 
         # >>> Validation
-        pack_validate(model, optimizer, state)
+        pack_validate(raw_model, optimizer, state)
 
-    pack_validate(model, optimizer, state)
+    pack_validate(raw_model, optimizer, state)
     report['time'] = timer.elapsed()
 
     # >>> Main artifacts (only rank 0 writes files in DDP mode)
