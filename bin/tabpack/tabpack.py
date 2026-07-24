@@ -1328,6 +1328,22 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     dataset = lib.data.build_dataset(**config['data'])
     assert dataset.n_bin_features == 0
     regression_label_stats = dataset.try_standardize_labels_()
+
+    # Shard train data across GPUs in DDP mode (before loading to GPU memory).
+    # Each GPU keeps only its slice of the data — avoids OOM when dataset > VRAM.
+    if distributed:
+        for key in dataset.data:
+            if 'train' in dataset.data[key]:
+                arr = dataset.data[key]['train']
+                n = len(arr)
+                # Round-robin: rank 0 gets [0, ws, 2*ws, ...], rank 1 gets [1, ws+1, ...]
+                dataset.data[key]['train'] = arr[slice(local_rank, n, lib.util.get_world_size())]
+        logger.info(
+            f'Sharded train data: rank={local_rank}, '
+            f'world_size={lib.util.get_world_size()}, '
+            f'local_size={dataset.size("train")}'
+        )
+
     dataset = dataset.to_torch(device)
     n_classes = dataset.task.try_compute_n_classes()
     Y_train = _make_Y_train(dataset)
@@ -1432,6 +1448,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         if config['optimizer']['type'] == 'MuonAdamWPack'
         else []
     )
+    # Scale learning rate for DDP (linear scaling rule).
+    optimizer_config = dict(config['optimizer'])
+    if distributed and 'lr' in optimizer_config:
+        optimizer_config['lr'] = optimizer_config['lr'] * lib.util.get_world_size()
+        logger.info(
+            f'Scaled learning rate: {config["optimizer"]["lr"]} -> {optimizer_config["lr"]}'
+        )
+
     optimizer = _make_optimizer(
         params=lib.deep.make_parameter_groups(
             model,
@@ -1439,7 +1463,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             custom_groups=muon_optimizer_parameter_groups,
         ),
         pack_size=raw_model.pack_size,
-        **config['optimizer'],  # type: ignore
+        **optimizer_config,  # type: ignore
         **(
             {}
             if configs_T is None or 'optimizer' not in configs_T
@@ -1464,7 +1488,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         partial(
             _evaluate,
             apply_model,
-            model,
+            raw_model,
             optimizer,
             dataset,
             regression_label_stats=regression_label_stats,
