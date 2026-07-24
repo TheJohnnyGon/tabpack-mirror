@@ -1336,15 +1336,29 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # Shard train data across GPUs in DDP mode (before loading to GPU memory).
     # Each GPU keeps only its slice of the data — avoids OOM when dataset > VRAM.
     if distributed:
+        world_size = lib.util.get_world_size()
+        train_slice = slice(local_rank, dataset.size('train'), world_size)
         for key in dataset.data:
             if 'train' in dataset.data[key]:
-                arr = dataset.data[key]['train']
-                n = len(arr)
-                # Round-robin: rank 0 gets [0, ws, 2*ws, ...], rank 1 gets [1, ws+1, ...]
-                dataset.data[key]['train'] = arr[slice(local_rank, n, lib.util.get_world_size())]
+                dataset.data[key]['train'] = dataset.data[key]['train'][train_slice]
+        # Also shard task labels to keep them in sync with sharded data.
+        dataset = dataclasses.replace(
+            dataset,
+            task=dataclasses.replace(
+                dataset.task,
+                labels={
+                    part: (
+                        labels[train_slice]
+                        if part == 'train'
+                        else labels
+                    )
+                    for part, labels in dataset.task.labels.items()
+                },
+            ),
+        )
         logger.info(
             f'Sharded train data: rank={local_rank}, '
-            f'world_size={lib.util.get_world_size()}, '
+            f'world_size={world_size}, '
             f'local_size={dataset.size("train")}'
         )
 
