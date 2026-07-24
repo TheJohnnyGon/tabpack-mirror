@@ -1536,7 +1536,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     logger.debug('Filled the report')
 
     # >>> Training loop
-    print()
+    if lib.util.is_main_process():
+        print()
     timer.run()
     pack_validate(raw_model, optimizer, state)
 
@@ -1839,19 +1840,20 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 for part, score in first_online_ensemble_scores.items()
             )
         )
-        print(
-            f'{"$" if first_online_ensemble_improved else " "}'
-            f'{"*" if best_scores_improved else " "}'
-            f' [E] {step // epoch_size:<3}'
-            f' [T] {datetime.timedelta(seconds=math.trunc(timer.elapsed()))}'
-            f' [L] {epoch_mean_loss / pack_size_before_stopping:.3f}'
-            f' [M] {report["n_models"]:<3}'
-            f'{"" if mean_scores_message is None else f" {mean_scores_message}"}'
-            f'{"" if best_scores_message is None else f" {best_scores_message}"}'
-            f'{"" if first_online_ensemble_scores_message is None else f" {first_online_ensemble_scores_message}"}'  # noqa: E501
-            f' [it/s] {training_throughput:<3} | {total_training_throughput:<5}'
-            # f' [e/t] {epoch_evaluation_duration / epoch_training_duration:.3f}'
-        )
+        if lib.util.is_main_process():
+            print(
+                f'{"$" if first_online_ensemble_improved else " "}'
+                f'{"*" if best_scores_improved else " "}'
+                f' [E] {step // epoch_size:<3}'
+                f' [T] {datetime.timedelta(seconds=math.trunc(timer.elapsed()))}'
+                f' [L] {epoch_mean_loss / pack_size_before_stopping:.3f}'
+                f' [M] {report["n_models"]:<3}'
+                f'{"" if mean_scores_message is None else f" {mean_scores_message}"}'
+                f'{"" if best_scores_message is None else f" {best_scores_message}"}'
+                f'{"" if first_online_ensemble_scores_message is None else f" {first_online_ensemble_scores_message}"}'  # noqa: E501
+                f' [it/s] {training_throughput:<3} | {total_training_throughput:<5}'
+                # f' [e/t] {epoch_evaluation_duration / epoch_training_duration:.3f}'
+            )
         del epoch_evaluation_duration
 
         # >>> Validation

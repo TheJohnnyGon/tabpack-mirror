@@ -209,8 +209,9 @@ def finish(exp: str | Path, report: Report) -> None:
     dump_summary(exp, summarize(report))
     _stop_running(exp)
 
-    print()
-    print(util.add_frame(load_summary(exp)))
+    if util.is_main_process():
+        print()
+        print(util.add_frame(load_summary(exp)))
     backup(exp)
 
 
@@ -375,12 +376,13 @@ def run[T](
     function_full_name = (
         None if function is None else util.get_function_full_name(function)
     )
-    util.print_sep()
-    print(
-        f'{"" if function_full_name is None else f"{function_full_name} | "}'
-        f'{util.try_get_relative_path(exp)}'
-        f' | {datetime.datetime.now()}'
-    )
+    if util.is_main_process():
+        util.print_sep()
+        print(
+            f'{"" if function_full_name is None else f"{function_full_name} | "}'
+            f'{util.try_get_relative_path(exp)}'
+            f' | {datetime.datetime.now()}'
+        )
     util.print_sep()
 
     # NOTE
@@ -418,8 +420,10 @@ def run[T](
             return None
 
     assert config is not None
-    print('\nConfig' if util.is_typed_dict(config_type) else '')
-    pprint(config, sort_dicts=False)
+    # Only print config on main process in DDP mode.
+    if util.is_main_process():
+        print('\nConfig' if util.is_typed_dict(config_type) else '')
+        pprint(config, sort_dicts=False)
 
     return function(config, exp)
 
