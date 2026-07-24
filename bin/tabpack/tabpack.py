@@ -1620,7 +1620,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             eval_metrics,
             predictions=eval_predictions,
             predictions_torch=eval_predictions_torch,
-            model_state_dict=model.state_dict(),
+            model_state_dict=raw_model.state_dict(),
         )
 
         pack_epochs_numlog.append(
