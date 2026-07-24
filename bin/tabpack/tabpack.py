@@ -1329,6 +1329,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     assert dataset.n_bin_features == 0
     regression_label_stats = dataset.try_standardize_labels_()
 
+    # Compute model-dependent properties BEFORE sharding (so all GPUs agree).
+    cat_cardinalities = dataset.compute_cat_cardinalities()
+    n_classes = dataset.task.try_compute_n_classes()
+
     # Shard train data across GPUs in DDP mode (before loading to GPU memory).
     # Each GPU keeps only its slice of the data — avoids OOM when dataset > VRAM.
     if distributed:
@@ -1345,7 +1349,6 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         )
 
     dataset = dataset.to_torch(device)
-    n_classes = dataset.task.try_compute_n_classes()
     Y_train = _make_Y_train(dataset)
     train_size = dataset.size('train')
 
@@ -1379,7 +1382,6 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     logger.debug('Transposed the configs')
 
     # >>> Model
-    cat_cardinalities = dataset.compute_cat_cardinalities()
     resolved_model_config = _prepare_model_config(
         config,
         (
