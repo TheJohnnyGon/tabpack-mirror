@@ -184,3 +184,6 @@ local
 # dev
 dev/docker/pyproject.toml
 dev/docker/uv.lock
+
+convert/new_peru/
+convert/peru/
