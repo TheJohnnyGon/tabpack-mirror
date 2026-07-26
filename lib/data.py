@@ -1,10 +1,10 @@
 import dataclasses
 import enum
+import gc
 import hashlib
 import json
 import os
-import pickle
-import tempfile
+import shutil
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +16,7 @@ import torch
 from loguru import logger
 from torch import Tensor
 
-from . import env
+from . import env, util
 from .metrics import calculate_metrics as calculate_metrics_
 from .types import DataKey, PartKey, PredictionType, TaskType
 
@@ -141,6 +141,10 @@ def apply_split(data: Any, split: Split, *, copy: bool = False) -> Any:
       all `np.ndarray`s with `dict[PartKey, np.ndarray]` using the provided `split`.
     """
     if isinstance(data, np.ndarray):
+        # Fancy indexing always creates a copy in NumPy.
+        # When `copy=False` and data is mmap, the slice is still materialized
+        # (NumPy has no way to avoid it for non-sequential indices), but at least
+        # the full mmap array stays non-resident.
         return {k: data[v].copy() if copy else data[v] for k, v in split.items()}
     elif isinstance(data, Mapping):
         return type(data)(
@@ -152,12 +156,32 @@ def apply_split(data: Any, split: Split, *, copy: bool = False) -> Any:
 
 
 def load_data(
-    dataset_dir: str | Path, split_id: SplitIDLike
+    dataset_dir: str | Path,
+    split_id: SplitIDLike,
+    *,
+    mmap: bool = False,
 ) -> dict[DataKey, dict[PartKey, np.ndarray]]:
+    """Load dataset from disk.
+
+    When ``mmap=True``, uses memory-mapped files so the full dataset never
+    becomes resident in RAM — only the split slices are materialized.
+    In DDP mode this means all processes share the same OS page cache
+    instead of each holding an independent copy.
+    """
     dataset_dir = _check_dataset_dir(dataset_dir)
-    data = {x.stem: np.load(x) for x in dataset_dir.iterdir() if _is_npy_path(x)}
+    load_kwargs = {'mmap_mode': 'r'} if mmap else {}
+    raw = {
+        x.stem: np.load(x, **load_kwargs)
+        for x in dataset_dir.iterdir()
+        if _is_npy_path(x)
+    }
     split = load_split(dataset_dir, split_id)
-    data = apply_split(data, split)
+    data = apply_split(raw, split)
+
+    # Free the mmap base arrays after splitting so the OS can drop pages.
+    if mmap:
+        del raw
+        gc.collect()
 
     info = load_info(dataset_dir)
     y_expected_dtype = (
@@ -201,52 +225,126 @@ class NumPolicy(enum.Enum):
 
 
 def transform_num(
-    X_num: dict[PartKey, np.ndarray], policy: None | str | NumPolicy, seed: None | int
+    X_num: dict[PartKey, np.ndarray],
+    policy: None | str | NumPolicy,
+    seed: None | int,
+    *,
+    transform_chunk_size: int = 5_000_000,
 ) -> dict[PartKey, np.ndarray]:
+    """Preprocess numerical features with minimal memory overhead.
+
+    Key optimizations vs. the original implementation:
+    - Noise is generated in float32 and added in-place.
+    - QuantileTransformer fits on a small subsample (10M rows max).
+    - ``transform`` processes each part in chunks, writing into a
+      pre-allocated float32 buffer (no intermediate float64 arrays).
+    - ``nan_to_num`` and ``astype`` use ``copy=False`` to avoid
+      unnecessary allocations when the data is already clean.
+    - Constant-column mask is computed on a subsample of train.
+    """
     if policy is not None:
         policy = NumPolicy(policy)
-        X_num_train = X_num['train']
-        if policy == NumPolicy.STANDARD:
-            normalizer = sklearn.preprocessing.StandardScaler()
-        elif policy == NumPolicy.NOISY_QUANTILE:
+
+        if policy == NumPolicy.NOISY_QUANTILE:
+            assert seed is not None
+            # Generate noise in float32 directly using the new Generator API
+            # (RandomState.standard_normal does not accept dtype parameter).
+            rng = np.random.default_rng(seed)
+            noise = rng.standard_normal(X_num['train'].shape, dtype=np.float32) * 1e-5
+            # Write back into the dict so the noisy data flows through both
+            # fit and transform below.  Rebinding a local variable would lose
+            # the noise for the chunked transform loop.
+            X_num['train'] = X_num['train'] + noise
+            del noise
+            del rng
+
+            # Fit QuantileTransformer on a manageable subsample.
+            # Fitting on all rows provides no statistical benefit for
+            # large datasets and creates huge internal sort buffers.
+            subsample_size = min(X_num['train'].shape[0], 10_000_000)
             normalizer = sklearn.preprocessing.QuantileTransformer(
                 n_quantiles=max(min(X_num['train'].shape[0] // 30, 1000), 10),
                 output_distribution='normal',
-                subsample=1_000_000_000,
+                subsample=subsample_size,
                 random_state=seed,
             )
-            assert seed is not None
-            X_num_train = X_num_train + np.random.RandomState(seed).normal(
-                0.0, 1e-5, X_num_train.shape
-            ).astype(X_num_train.dtype)
+        elif policy == NumPolicy.STANDARD:
+            normalizer = sklearn.preprocessing.StandardScaler()
         else:
             raise ValueError(f'Unknown policy={policy}')
 
-        normalizer.fit(X_num_train)
-        X_num = {k: normalizer.transform(v) for k, v in X_num.items()}  # type: ignore
+        normalizer.fit(X_num['train'])
+
+        # Transform each part in chunks, writing into a pre-allocated
+        # float32 buffer to avoid QuantileTransformer returning float64.
+        result = {}
+        for part, arr in X_num.items():
+            n_rows = arr.shape[0]
+            n_cols = arr.shape[1]
+            buf = np.empty((n_rows, n_cols), dtype=_X_NUM_DTYPE)
+            for start in range(0, n_rows, transform_chunk_size):
+                end = min(start + transform_chunk_size, n_rows)
+                chunk_out = normalizer.transform(arr[start:end])
+                chunk_out = chunk_out.astype(_X_NUM_DTYPE, copy=False)
+                buf[start:end] = chunk_out
+            result[part] = buf
+        X_num = result
 
     # NOTE
     # (This is not a good way to process NaNs)
     # This is a quick hack to stop failing on some datasets because of NaNs.
     # NaNs are replaced with zeros (zero is the mean value for all features after
     # the conventional preprocessing techniques).
-    X_num = {k: np.nan_to_num(v) for k, v in X_num.items()}
+    X_num = {k: np.nan_to_num(v, copy=False) for k, v in X_num.items()}
 
     # Remove columns with one constant value.
-    mask = np.array([len(np.unique(x)) > 1 for x in X_num['train'].T])
+    # Compute the mask on a subsample to avoid sorting every column.
+    # Use a seeded RNG to ensure deterministic results across runs and DDP ranks.
+    train = X_num['train']
+    rng = np.random.RandomState(seed if seed is not None else 42)
+    subsample_idx = rng.choice(
+        train.shape[0], min(train.shape[0], 5_000_000), replace=False
+    )
+    mask = np.array(
+        [len(np.unique(train[subsample_idx, col])) > 1 for col in range(train.shape[1])]
+    )
     X_num = {k: v[:, mask] for k, v in X_num.items()}
 
-    X_num = {k: v.astype(_X_NUM_DTYPE) for k, v in X_num.items()}
+    X_num = {k: v.astype(_X_NUM_DTYPE, copy=False) for k, v in X_num.items()}
     return X_num
 
 
 def _extract_bin_from_num(
     X_num: dict[PartKey, np.ndarray],
 ) -> tuple[None | dict[PartKey, np.ndarray], None | dict[PartKey, np.ndarray]]:
-    X_num_all = np.concatenate(list(X_num.values()))
-    has_missing_values = np.any(np.isnan(X_num_all), 0)
-    unique_values = [np.unique(x) for x in X_num_all.T]
-    unique_counts = np.array([len(x) for x in unique_values])
+    X_num_train = X_num['train']
+    n_cols = X_num_train.shape[1]
+
+    # Check for missing values and unique values per column across ALL parts.
+    # Use np.unique per part + np.union1d to merge (C-speed, sorted output).
+    # Early-exit when unique count exceeds 2 (column is not binary).
+    has_missing_values = np.zeros(n_cols, dtype=bool)
+    unique_values: list[np.ndarray] = []
+    for col in range(n_cols):
+        has_nan_col = False
+        merged: np.ndarray | None = None
+        for part_arr in X_num.values():
+            col_data = part_arr[:, col]
+            if not has_nan_col:
+                has_nan_col = np.any(np.isnan(col_data))
+            pu = np.unique(col_data)
+            merged = pu if merged is None else np.union1d(merged, pu)
+            if len(merged) > 2:
+                break  # not binary, no point continuing
+        has_missing_values[col] = has_nan_col
+        if merged is None:
+            # Empty X_num — should not happen in normal operation, but guard
+            # against len(None) → TypeError downstream.
+            unique_values.append(np.array([], dtype=X_num_train.dtype))
+        else:
+            unique_values.append(merged)
+
+    unique_counts = np.array([len(u) for u in unique_values])
 
     bin_mask = (unique_counts == 2) & ~has_missing_values
     bin_idx = np.nonzero(bin_mask)[0]
@@ -256,7 +354,7 @@ def _extract_bin_from_num(
             categories=[unique_values[i] for i in bin_idx]
         )
         transformer.fit(X_num['train'][:, bin_idx])
-        if len(bin_idx) == X_num_all.shape[1]:
+        if len(bin_idx) == n_cols:
             # All the features are binary.
             return (
                 {k: transformer.transform(v).astype(bool) for k, v in X_num.items()},
@@ -381,6 +479,27 @@ class Task:
             Score(task_info['score']),
         )
 
+    @classmethod
+    def from_data(
+        cls,
+        data: dict[DataKey, dict[PartKey, np.ndarray]],
+        dataset_dir: str | Path,
+    ) -> 'Task':
+        """Build a Task from already-loaded data (avoids loading y.npy a second time).
+
+        The ``y`` arrays are extracted from ``data`` and copied so the Task owns
+        an independent reference (preventing accidental mutation).
+        """
+        y = data['y']
+        task_info = load_info(dataset_dir)['task']
+        # Copy the labels so the Task owns an independent reference.
+        labels = {k: v.copy() for k, v in y.items()}
+        return Task(
+            labels,
+            TaskType(task_info['type']),
+            Score(task_info['score']),
+        )
+
     def __post_init__(self):
         assert isinstance(self.type_, TaskType)
         assert isinstance(self.score, Score)
@@ -448,7 +567,9 @@ class Dataset[T: np.ndarray | Tensor]:
 
     @classmethod
     def from_dir(cls, path: str | Path, split_id: SplitIDLike) -> 'Dataset[np.ndarray]':
-        return Dataset(load_data(path, split_id), Task.from_dir(path, split_id))
+        data = load_data(path, split_id, mmap=True)
+        task = Task.from_data(data, path)
+        return Dataset(data, task)
 
     def _is_numpy(self) -> bool:
         return isinstance(self.data['y']['train'], np.ndarray)
@@ -539,6 +660,109 @@ class Dataset[T: np.ndarray | Tensor]:
         return self.standardize_labels_() if self.task.is_regression else None
 
 
+def _cache_key(
+    path: Path,
+    split_id: SplitIDLike,
+    extract_bin_from_num: bool,
+    num_policy: None | str | NumPolicy,
+    bin_policy: None | str | BinPolicy,
+    cat_policy: None | str | CatPolicy,
+    task_score: None | str | Score,
+    seed: int,
+) -> Path:
+    """Compute the cache directory path for a given build_dataset configuration."""
+    args = {
+        'split_id': split_id,
+        'extract_bin_from_num': extract_bin_from_num,
+        'num_policy': num_policy,
+        'bin_policy': bin_policy,
+        'cat_policy': cat_policy,
+        'task_score': task_score,
+        'seed': seed,
+    }
+    h = hashlib.md5(str(args).encode('utf-8')).hexdigest()
+    return env.get_cache_dir() / f'build_dataset__{path.name}__{h}'
+
+
+def _cache_is_complete(cache_dir: Path) -> bool:
+    """Check that the cache directory has the _COMPLETE marker file.
+
+    This ensures we never read a partially-written cache (e.g. from a
+    crashed previous run).
+    """
+    return (cache_dir / '_COMPLETE').exists()
+
+
+def _save_dataset_cache(dataset: Dataset[np.ndarray], cache_dir: Path) -> None:
+    """Save a dataset to cache as individual .npy files + metadata json.
+
+    Writes to a temporary directory first, then atomically renames to the
+    final path and creates a _COMPLETE marker. This prevents other processes
+    from reading a partially-written cache.
+    """
+    tmp_dir = cache_dir.with_suffix('.tmp')
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    # Save each array as a separate .npy file.
+    for data_key, parts in dataset.data.items():
+        part_dir = tmp_dir / 'data' / data_key
+        part_dir.mkdir(parents=True, exist_ok=True)
+        for part_key, arr in parts.items():
+            np.save(part_dir / f'{part_key}.npy', arr)
+
+    # Save task info.
+    task_dir = tmp_dir / 'task'
+    task_dir.mkdir(parents=True, exist_ok=True)
+    for part_key, arr in dataset.task.labels.items():
+        np.save(task_dir / f'{part_key}.npy', arr)
+
+    # Save metadata.
+    meta = {
+        'type_': dataset.task.type_.value,
+        'score': dataset.task.score.value,
+    }
+    (tmp_dir / 'meta.json').write_text(json.dumps(meta))
+
+    # Atomic rename + completion marker.
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    os.rename(tmp_dir, cache_dir)
+    (cache_dir / '_COMPLETE').touch()
+
+
+def _load_dataset_cache(cache_dir: Path) -> Dataset[np.ndarray]:
+    """Load a dataset from cache directory.
+
+    Uses mmap_mode='r' so all DDP processes share the same OS page cache
+    instead of each holding an independent copy.
+    """
+    data = {}
+    data_root = cache_dir / 'data'
+    for key_dir in data_root.iterdir():
+        if key_dir.is_dir():
+            data[key_dir.name] = {}
+            for part_file in key_dir.iterdir():
+                if part_file.suffix == '.npy':
+                    part_key = part_file.stem
+                    data[key_dir.name][part_key] = np.load(
+                        part_file, mmap_mode='r'
+                    )
+
+    task_dir = cache_dir / 'task'
+    labels = {}
+    for part_file in task_dir.iterdir():
+        if part_file.suffix == '.npy':
+            part_key = part_file.stem
+            labels[part_key] = np.load(part_file, mmap_mode='r')
+
+    meta = json.loads((cache_dir / 'meta.json').read_text())
+    task = Task(labels, TaskType(meta['type_']), Score(meta['score']))
+
+    return Dataset(data, task)
+
+
 def build_dataset(
     path: str | Path,
     split_id: SplitIDLike = DEFAULT_SPLIT_ID,
@@ -552,21 +776,33 @@ def build_dataset(
     cache: bool = False,
 ) -> Dataset[np.ndarray]:
     path = Path(path).resolve()
+    cache_dir = None
+
     if cache:
-        args = locals()
-        args.pop('cache')
-        args.pop('path')
-        cache_path = env.get_cache_dir() / (
-            f'build_dataset__{path.name}__{hashlib.md5(str(args).encode("utf-8")).hexdigest()}.pickle'
+        cache_dir = _cache_key(
+            path, split_id, extract_bin_from_num, num_policy,
+            bin_policy, cat_policy, task_score, seed,
         )
-        if cache_path.exists():
-            cached_args, cached_value = pickle.loads(cache_path.read_bytes())
-            assert args == cached_args, f'Hash collision for {cache_path}'
-            logger.info(f'Using cached dataset: {cache_path.name}')
-            return cached_value
-    else:
-        args = None
-        cache_path = None
+        distributed = util.is_distributed()
+        local_rank = util.get_local_rank()
+
+        if _cache_is_complete(cache_dir):
+            # Cache is complete — all ranks read it directly.
+            # No barrier needed (barrier is a collective op; if only some
+            # ranks enter it, the others hang forever).
+            logger.info(f'Using cached dataset: {cache_dir.name}')
+            return _load_dataset_cache(cache_dir)
+        elif distributed and local_rank != 0:
+            # Rank 0 will build the cache; others poll for completion.
+            # We cannot use dist.barrier() here because rank 0 does not
+            # enter this branch — a barrier requires ALL ranks, so it
+            # would deadlock.  Polling on the _COMPLETE marker is safe
+            # since _save_dataset_cache creates it after os.rename.
+            import time
+            while not _cache_is_complete(cache_dir):
+                time.sleep(0.1)
+            logger.info(f'Using cached dataset (built by rank 0): {cache_dir.name}')
+            return _load_dataset_cache(cache_dir)
 
     dataset = Dataset.from_dir(path, split_id)
     if task_score is not None:
@@ -607,8 +843,10 @@ def build_dataset(
     if 'x_cat' in dataset.data:
         dataset.data['x_cat'] = transform_cat(dataset.data['x_cat'], cat_policy)
 
-    if cache_path is not None:
-        with tempfile.NamedTemporaryFile('wb') as tmp_cache_file:
-            tmp_cache_file.write(pickle.dumps((args, dataset)))
-            os.rename(tmp_cache_file.name, cache_path)
+    # Save cache (only rank 0 in DDP mode, or when not distributed).
+    if cache_dir is not None:
+        distributed = util.is_distributed()
+        local_rank = util.get_local_rank()
+        if not distributed or local_rank == 0:
+            _save_dataset_cache(dataset, cache_dir)
     return dataset

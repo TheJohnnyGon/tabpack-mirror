@@ -853,15 +853,34 @@ def generate_training_batches(
     batch_size: int,
     batch_generator: torch.Generator,
     pack_size: int,
+    device: torch.device,
 ) -> list[Tensor]:
-    """Generate training batches for one epoch."""
-    random_values = torch.rand(
-        (pack_size, train_size),
-        generator=batch_generator,
-        device=batch_generator.device,
+    """Generate training batches for one epoch.
+
+    Returns a list of 2D tensors of shape ``(pack_size, batch_size)``.
+    Each tensor represents one training step: all ``pack_size`` models
+    train on their own permutation of rows simultaneously.
+
+    To avoid the VRAM peak of ``pack_size × train_size × 12`` bytes
+    (from the old rand+argsort approach), permutations are generated on
+    CPU and transferred to GPU batch-by-batch.
+    """
+    # Draw a random seed from the CUDA generator each epoch so the
+    # permutations change between epochs.  torch.randint advances the
+    # generator's internal state, guaranteeing different seeds.
+    epoch_seed = torch.randint(
+        0, 2**62, (1,), generator=batch_generator, device=batch_generator.device
+    ).item()
+    cpu_gen = torch.Generator('cpu').manual_seed(epoch_seed)
+    # Generate all permutations on CPU: shape (pack_size, train_size), int64.
+    perms = torch.stack(
+        [torch.randperm(train_size, generator=cpu_gen) for _ in range(pack_size)]
     )
-    batches = random_values.argsort(dim=BATCH_DIM).split(batch_size, dim=BATCH_DIM)
-    batches = list(batches)
+    # Split into batches along BATCH_DIM and transfer to device.
+    batches: list[Tensor] = []
+    for start in range(0, train_size, batch_size):
+        end = min(start + batch_size, train_size)
+        batches.append(perms[:, start:end].to(device, non_blocking=True))
     return batches
 
 
@@ -1335,12 +1354,16 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
 
     # Shard train data across GPUs in DDP mode (before loading to GPU memory).
     # Each GPU keeps only its slice of the data — avoids OOM when dataset > VRAM.
+    # Use np.ascontiguousarray to materialize the shard and break the reference
+    # to the full strided view, so the original large array can be GC'd.
     if distributed:
         world_size = lib.util.get_world_size()
         train_slice = slice(local_rank, dataset.size('train'), world_size)
         for key in dataset.data:
             if 'train' in dataset.data[key]:
-                dataset.data[key]['train'] = dataset.data[key]['train'][train_slice]
+                dataset.data[key]['train'] = np.ascontiguousarray(
+                    dataset.data[key]['train'][train_slice]
+                )
         # Also shard task labels to keep them in sync with sharded data.
         dataset = dataclasses.replace(
             dataset,
@@ -1348,7 +1371,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 dataset.task,
                 labels={
                     part: (
-                        labels[train_slice]
+                        np.ascontiguousarray(labels[train_slice])
                         if part == 'train'
                         else labels
                     )
@@ -1362,7 +1385,17 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             f'local_size={dataset.size("train")}'
         )
 
+    # Convert to torch tensors. ``to_torch`` returns a *new* Dataset object,
+    # so store the numpy version temporarily to free it explicitly afterward.
+    numpy_dataset = dataset
     dataset = dataset.to_torch(device)
+
+    # Free numpy copies of the data now that everything is on GPU.
+    # This is critical in DDP where each process holds a full preprocessed
+    # dataset in numpy before the shard+to_torch step.
+    del numpy_dataset
+    gc.collect()
+
     Y_train = _make_Y_train(dataset)
     train_size = dataset.size('train')
 
@@ -1603,6 +1636,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             batch_size=config['batch_size'],
             batch_generator=batch_generator,
             pack_size=state.pack_size,
+            device=device,
         )
         batch_losses = []
         batch_sizes = []
@@ -1626,21 +1660,21 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             step += 1
             state.step()
 
-            loss_detached = loss.detach()
-            batch_losses.append(loss_detached)
+            loss_value = loss.item()
+            batch_losses.append(loss_value)
             batch_sizes.append(batch_idx.shape[BATCH_DIM])
             steps_numlog.append(
                 {
                     'step': step,
                     'time': timer.elapsed(),
                     'batch_size': batch_sizes[-1],
-                    'loss': loss_detached,
+                    'loss': loss_value,
                 }
             )
 
         epoch_training_duration = time.perf_counter() - epoch_training_start_time
 
-        del batches, batch_idx, losses, loss, loss_detached  # pyright: ignore[reportPossiblyUnboundVariable]
+        del batches, batch_idx, losses, loss, loss_value  # pyright: ignore[reportPossiblyUnboundVariable]
         _free_mps_memory()
 
         if config.get('track_memory_usage', False):
