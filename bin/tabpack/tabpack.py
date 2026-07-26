@@ -1860,9 +1860,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         # Compute statistics.
         training_throughput = math.trunc(epoch_size / epoch_training_duration)
         total_training_throughput = training_throughput * pack_size_before_stopping
-        epoch_mean_loss = statistics.fmean(
-            torch.stack(batch_losses).tolist(), batch_sizes
-        )
+        epoch_mean_loss = statistics.fmean(batch_losses, batch_sizes)
         if track_experiments:
             mean_scores, mean_scores_improved = _get_mean_scores(
                 mean_scores, experiments, state, eval_parts
