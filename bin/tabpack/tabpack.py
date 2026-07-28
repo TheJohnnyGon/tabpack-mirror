@@ -937,9 +937,11 @@ def _evaluate(
 # Utilities
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 def _free_mps_memory() -> None:
+    gc.collect()
     if torch.mps.is_available():
-        gc.collect()
         torch.mps.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _make_Y_train(dataset: lib.data.Dataset[Tensor]) -> Tensor:
@@ -1324,6 +1326,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     assert dataset.n_bin_features == 0
     regression_label_stats = dataset.try_standardize_labels_()
     dataset = dataset.to_torch(device)
+    # Free numpy arrays that were replaced by torch tensors on GPU.
+    _free_mps_memory()
     n_classes = dataset.task.try_compute_n_classes()
     Y_train = _make_Y_train(dataset)
     train_size = dataset.size('train')

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import gc
 import numpy as np
 import sklearn.preprocessing
 import torch
@@ -223,20 +224,34 @@ def transform_num(
             raise ValueError(f'Unknown policy={policy}')
 
         normalizer.fit(X_num_train)
-        X_num = {k: normalizer.transform(v) for k, v in X_num.items()}  # type: ignore
+        del X_num_train
+
+        # Transform one part at a time to reduce peak memory.
+        X_num_transformed = {}
+        for k, v in X_num.items():
+            X_num_transformed[k] = normalizer.transform(v)
+            del v
+        X_num = X_num_transformed
+        del normalizer
+        gc.collect()
 
     # NOTE
     # (This is not a good way to process NaNs)
     # This is a quick hack to stop failing on some datasets because of NaNs.
     # NaNs are replaced with zeros (zero is the mean value for all features after
     # the conventional preprocessing techniques).
-    X_num = {k: np.nan_to_num(v) for k, v in X_num.items()}
+    X_num_nan = {k: np.nan_to_num(v) for k, v in X_num.items()}
+    del X_num
 
     # Remove columns with one constant value.
-    mask = np.array([len(np.unique(x)) > 1 for x in X_num['train'].T])
-    X_num = {k: v[:, mask] for k, v in X_num.items()}
+    # np.ptp (peak-to-peak, max - min) is much faster than np.unique for this check.
+    mask = np.ptp(X_num_nan['train'], axis=0) != 0
+    X_num_masked = {k: v[:, mask] for k, v in X_num_nan.items()}
+    del X_num_nan, mask
 
-    X_num = {k: v.astype(_X_NUM_DTYPE) for k, v in X_num.items()}
+    X_num = {k: v.astype(_X_NUM_DTYPE) for k, v in X_num_masked.items()}
+    del X_num_masked
+    gc.collect()
     return X_num
 
 
@@ -301,25 +316,38 @@ def transform_cat(
         unknown_value=unknown_value,  # type: ignore
         dtype='int64',  # type: ignore
     ).fit(X_cat['train'])
-    X_cat = {k: encoder.transform(v) for k, v in X_cat.items()}
-    max_values = X_cat['train'].max(axis=0)
+
+    X_cat_encoded = {}
+    for k, v in X_cat.items():
+        X_cat_encoded[k] = encoder.transform(v)
+        del v
+    del X_cat, encoder
+
+    max_values = X_cat_encoded['train'].max(axis=0)
     for part in ['val', 'test']:
         part = cast(PartKey, part)
-        for column_idx in range(X_cat[part].shape[1]):
-            X_cat[part][X_cat[part][:, column_idx] == unknown_value, column_idx] = (
+        for column_idx in range(X_cat_encoded[part].shape[1]):
+            X_cat_encoded[part][X_cat_encoded[part][:, column_idx] == unknown_value, column_idx] = (
                 max_values[column_idx] + 1
             )
+    del max_values
 
     if policy == CatPolicy.ORDINAL:
-        return X_cat
+        return X_cat_encoded
     elif policy == CatPolicy.ONE_HOT:
         encoder = sklearn.preprocessing.OneHotEncoder(
             handle_unknown='ignore',
             sparse_output=False,
             dtype=np.float32,  # type: ignore
         )
-        encoder.fit(X_cat['train'])
-        return {k: cast(np.ndarray, encoder.transform(v)) for k, v in X_cat.items()}
+        encoder.fit(X_cat_encoded['train'])
+        X_cat_onehot = {}
+        for k, v in X_cat_encoded.items():
+            X_cat_onehot[k] = cast(np.ndarray, encoder.transform(v))
+            del v
+        del X_cat_encoded, encoder
+        gc.collect()
+        return X_cat_onehot
     else:
         raise ValueError(f'Unknown policy={policy}')
 
