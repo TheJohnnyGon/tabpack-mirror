@@ -1322,12 +1322,16 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         torch.cuda.reset_peak_memory_stats(device)
 
     # >>> Data
+    print('Loading dataset...')
     dataset = lib.data.build_dataset(**config['data'])
     assert dataset.n_bin_features == 0
+    print(f'Dataset loaded: {dataset.size("train")} train, {dataset.size("val")} val, {dataset.size("test")} test')
     regression_label_stats = dataset.try_standardize_labels_()
+    print('Moving data to GPU...')
     dataset = dataset.to_torch(device)
     # Free numpy arrays that were replaced by torch tensors on GPU.
     _free_mps_memory()
+    print('Data on GPU, freed numpy arrays')
     n_classes = dataset.task.try_compute_n_classes()
     Y_train = _make_Y_train(dataset)
     train_size = dataset.size('train')

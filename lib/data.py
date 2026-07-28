@@ -596,6 +596,7 @@ def build_dataset(
         args = None
         cache_path = None
 
+    print(f'Loading dataset from {path.name}...')
     dataset = Dataset.from_dir(path, split_id)
     if task_score is not None:
         dataset = dataclasses.replace(
@@ -603,6 +604,7 @@ def build_dataset(
         )
 
     if 'x_num' in dataset.data and extract_bin_from_num:
+        print('Extracting binary features from numerical...')
         extracted_x_bin, remaining_x_num = _extract_bin_from_num(dataset.data['x_num'])
         if extracted_x_bin is not None:
             if remaining_x_num is None:
@@ -622,10 +624,12 @@ def build_dataset(
     # The presence of "x_num" may change after the binary feature extraction,
     # so it must be checked again.
     if 'x_num' in dataset.data:
+        print(f'Transforming numerical features (policy={num_policy})...')
         dataset.data['x_num'] = transform_num(dataset.data['x_num'], num_policy, seed)
 
     if 'x_bin' in dataset.data:
         if bin_policy is not None:
+            print(f'Transforming binary features (policy={bin_policy})...')
             bin_policy = BinPolicy(bin_policy)
             if bin_policy == BinPolicy.CONVERT_TO_CAT:
                 dataset.convert_bin_features_to_cat_()
@@ -633,6 +637,7 @@ def build_dataset(
                 raise ValueError(f'Unknown {bin_policy=}')
 
     if 'x_cat' in dataset.data:
+        print(f'Transforming categorical features (policy={cat_policy})...')
         dataset.data['x_cat'] = transform_cat(dataset.data['x_cat'], cat_policy)
 
     if cache_path is not None:
