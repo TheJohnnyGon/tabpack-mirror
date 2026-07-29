@@ -297,7 +297,6 @@ def _extract_bin_from_num(
                 gc.collect()
                 return X_bin, X_num_remaining
         else:
-            del unique_values
             transformer = sklearn.preprocessing.OrdinalEncoder(
                 categories=[unique_values[i] for i in bin_idx]
             )
