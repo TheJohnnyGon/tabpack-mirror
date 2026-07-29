@@ -1902,6 +1902,20 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
                 'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
             }
+            
+            # Save weights of greedy ensemble models that haven't finished yet
+            # (they are still in state.best_model_state_dicts)
+            if ensemble_info['ids'] is not None and state.pack_size > 0:
+                for greedy_id in ensemble_info['ids']:
+                    if greedy_id not in saved_model_state_dicts:
+                        # Find this model in the current state
+                        state_idx = np.where(state.ids == greedy_id)[0]
+                        if len(state_idx) > 0:
+                            i = int(state_idx[0])
+                            saved_model_state_dicts[greedy_id] = {
+                                name: value[i : i + 1].detach().cpu().clone()
+                                for name, value in state.best_model_state_dicts.items()
+                            }
         
         torch.save(
             {
