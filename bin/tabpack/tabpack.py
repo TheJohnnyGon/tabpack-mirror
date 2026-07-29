@@ -1908,19 +1908,40 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 # Create new dict with only greedy ensemble models
                 ensemble_state_dicts = {}
                 
+                # Check if greedy ensemble uses 'latest' predictions
+                greedy_uses_latest = (
+                    online_ensembles['greedy']._update_type == 'latest'
+                )
+                
+                # Get current model state dict if needed
+                current_model_state_dict = None
+                if greedy_uses_latest:
+                    current_model_state_dict = model.state_dict()
+                
                 for greedy_id in ensemble_info['ids']:
                     # Check if model is in finished models
                     if greedy_id in saved_model_state_dicts:
+                        # For finished models, we have best weights saved
+                        # But if greedy uses latest, we need to check if this is correct
+                        # For now, use saved best weights (they were saved when model finished)
                         ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
                     else:
                         # Check if model is still in current state
                         state_idx = np.where(state.ids == greedy_id)[0]
                         if len(state_idx) > 0:
                             i = int(state_idx[0])
-                            ensemble_state_dicts[greedy_id] = {
-                                name: value[i : i + 1].detach().cpu().clone()
-                                for name, value in state.best_model_state_dicts.items()
-                            }
+                            
+                            # Use current weights if greedy uses latest, otherwise use best
+                            if greedy_uses_latest and current_model_state_dict is not None:
+                                ensemble_state_dicts[greedy_id] = {
+                                    name: value[i : i + 1].detach().cpu().clone()
+                                    for name, value in current_model_state_dict.items()
+                                }
+                            else:
+                                ensemble_state_dicts[greedy_id] = {
+                                    name: value[i : i + 1].detach().cpu().clone()
+                                    for name, value in state.best_model_state_dicts.items()
+                                }
                 
                 # Replace saved_model_state_dicts with ensemble-only version
                 saved_model_state_dicts.clear()
