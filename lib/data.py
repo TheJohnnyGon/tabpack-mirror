@@ -257,36 +257,68 @@ def transform_num(
 
 def _extract_bin_from_num(
     X_num: dict[PartKey, np.ndarray],
+    *,
+    skip_encoder: bool = False,
 ) -> tuple[None | dict[PartKey, np.ndarray], None | dict[PartKey, np.ndarray]]:
+    """Extract binary (0/1) features from numerical features.
+
+    When `skip_encoder=True`, skips OrdinalEncoder and directly casts 0/1 columns
+    to int64, avoiding large temporary allocations from sklearn's transformer.
+    """
     X_num_all = np.concatenate(list(X_num.values()))
     has_missing_values = np.any(np.isnan(X_num_all), 0)
     unique_values = [np.unique(x) for x in X_num_all.T]
     unique_counts = np.array([len(x) for x in unique_values])
+    del X_num_all  # Free the concatenated copy immediately
 
     bin_mask = (unique_counts == 2) & ~has_missing_values
     bin_idx = np.nonzero(bin_mask)[0]
+    del unique_counts, has_missing_values
 
     if len(bin_idx) > 0:
-        transformer = sklearn.preprocessing.OrdinalEncoder(
-            categories=[unique_values[i] for i in bin_idx]
+        # Verify all detected "binary" columns are actually 0/1.
+        is_01 = all(
+            set(unique_values[i]) == {0.0, 1.0} for i in bin_idx
         )
-        transformer.fit(X_num['train'][:, bin_idx])
-        if len(bin_idx) == X_num_all.shape[1]:
-            # All the features are binary.
-            return (
-                {k: transformer.transform(v).astype(bool) for k, v in X_num.items()},
-                None,
-            )
+
+        if skip_encoder and is_01:
+            # Direct cast — no sklearn transformer, minimal copies.
+            if len(bin_idx) == len(unique_values):
+                # All features are binary.
+                X_bin = {k: v.astype(_X_CAT_INT_DTYPE, copy=False) for k, v in X_num.items()}
+                del X_num
+                gc.collect()
+                return X_bin, None
+            else:
+                # Some features are binary.
+                X_bin = {k: v[:, bin_idx].astype(_X_CAT_INT_DTYPE, copy=False) for k, v in X_num.items()}
+                X_num_remaining = {k: v[:, ~bin_mask] for k, v in X_num.items()}
+                del X_num
+                gc.collect()
+                return X_bin, X_num_remaining
         else:
-            # Some of the features are binary.
-            return (
-                {
-                    k: transformer.transform(v[:, bin_idx]).astype(bool)
-                    for k, v in X_num.items()
-                },
-                {k: v[:, ~bin_mask] for k, v in X_num.items()},
+            del unique_values
+            transformer = sklearn.preprocessing.OrdinalEncoder(
+                categories=[unique_values[i] for i in bin_idx]
             )
+            transformer.fit(X_num['train'][:, bin_idx])
+            if len(bin_idx) == len(unique_values):
+                # All the features are binary.
+                return (
+                    {k: transformer.transform(v).astype(bool) for k, v in X_num.items()},
+                    None,
+                )
+            else:
+                # Some of the features are binary.
+                return (
+                    {
+                        k: transformer.transform(v[:, bin_idx]).astype(bool)
+                        for k, v in X_num.items()
+                    },
+                    {k: v[:, ~bin_mask] for k, v in X_num.items()},
+                )
     else:
+        del unique_values
         # No binary features.
         return None, X_num
 
@@ -572,6 +604,7 @@ def build_dataset(
     split_id: SplitIDLike = DEFAULT_SPLIT_ID,
     *,
     extract_bin_from_num: bool = False,
+    skip_bin_encoder: bool = False,
     num_policy: None | str | NumPolicy = None,
     bin_policy: None | str | BinPolicy = None,
     cat_policy: None | str | CatPolicy = None,
@@ -605,7 +638,9 @@ def build_dataset(
 
     if 'x_num' in dataset.data and extract_bin_from_num:
         print('Extracting binary features from numerical...')
-        extracted_x_bin, remaining_x_num = _extract_bin_from_num(dataset.data['x_num'])
+        extracted_x_bin, remaining_x_num = _extract_bin_from_num(
+            dataset.data['x_num'], skip_encoder=skip_bin_encoder
+        )
         if extracted_x_bin is not None:
             if remaining_x_num is None:
                 del dataset.data['x_num']
