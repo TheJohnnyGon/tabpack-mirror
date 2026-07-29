@@ -255,6 +255,85 @@ def transform_num(
     return X_num
 
 
+def _transform_num_columnwise(
+    X_num: dict[PartKey, np.ndarray],
+    policy: NumPolicy,
+    seed: int,
+) -> dict[PartKey, np.ndarray]:
+    """Column-wise transform to reduce peak RAM.
+
+    Instead of fitting/transforming the entire matrix at once, process one column
+    at a time.  This keeps peak memory proportional to a single column rather
+    than the full dataset.
+    """
+    n_rows, n_cols = X_num['train'].shape
+    parts = list(X_num.keys())
+
+    # First pass: determine which columns are constant (to drop later).
+    constant_mask = np.ptp(X_num['train'], axis=0) == 0  # (n_cols,)
+
+    # Prepare output arrays (pre-allocated, no constant columns).
+    active_cols = np.nonzero(~constant_mask)[0]
+    n_active = len(active_cols)
+    X_out = {k: np.empty((len(v), n_active), dtype=_X_NUM_DTYPE) for k, v in X_num.items()}
+
+    col_out = 0
+    for col_in in range(n_cols):
+        if constant_mask[col_in]:
+            continue
+
+        # --- Fit on this single column (train) ---
+        train_col = X_num['train'][:, col_in]  # view, 1-D
+
+        if policy == NumPolicy.STANDARD:
+            mean = train_col.mean()
+            std = train_col.std()
+            if std == 0:
+                std = 1.0
+        elif policy == NumPolicy.NOISY_QUANTILE:
+            # Add noise to a copy of this one column only.
+            fit_data = train_col.copy()
+            noise = np.random.RandomState(seed + col_in).normal(
+                0.0, 1e-5, fit_data.shape
+            ).astype(fit_data.dtype)
+            fit_data += noise
+            normalizer = sklearn.preprocessing.QuantileTransformer(
+                n_quantiles=max(min(n_rows // 30, 1000), 10),
+                output_distribution='normal',
+                random_state=seed,
+            )
+            normalizer.fit(fit_data.reshape(-1, 1))
+            del fit_data, noise
+        else:
+            raise ValueError(f'Unknown policy={policy}')
+
+        # --- Transform all parts for this column ---
+        for k in parts:
+            part_col = X_num[k][:, col_in]  # view, 1-D
+
+            if policy == NumPolicy.STANDARD:
+                transformed = ((part_col - mean) / std).astype(_X_NUM_DTYPE)
+            else:
+                transformed = normalizer.transform(part_col.reshape(-1, 1)).astype(_X_NUM_DTYPE).ravel()
+
+            # Replace NaN with 0 (same as original behaviour).
+            transformed = np.nan_to_num(transformed, copy=False)
+            X_out[k][:, col_out] = transformed
+
+        del train_col, part_col, transformed
+
+        if policy == NumPolicy.NOISY_QUANTILE:
+            del normalizer
+
+        col_out += 1
+        if col_in % 500 == 499:
+            gc.collect()
+
+    del X_num
+    gc.collect()
+    return X_out
+
+
 def _extract_bin_from_num(
     X_num: dict[PartKey, np.ndarray],
     *,
@@ -605,6 +684,7 @@ def build_dataset(
     extract_bin_from_num: bool = False,
     skip_bin_encoder: bool = False,
     num_policy: None | str | NumPolicy = None,
+    num_memory_efficient: bool = False,
     bin_policy: None | str | BinPolicy = None,
     cat_policy: None | str | CatPolicy = None,
     task_score: None | str | Score = None,
@@ -658,8 +738,13 @@ def build_dataset(
     # The presence of "x_num" may change after the binary feature extraction,
     # so it must be checked again.
     if 'x_num' in dataset.data:
-        print(f'Transforming numerical features (policy={num_policy})...')
-        dataset.data['x_num'] = transform_num(dataset.data['x_num'], num_policy, seed)
+        print(f'Transforming numerical features (policy={num_policy}, memory_efficient={num_memory_efficient})...')
+        if num_memory_efficient and num_policy is not None:
+            dataset.data['x_num'] = _transform_num_columnwise(
+                dataset.data['x_num'], NumPolicy(num_policy), seed
+            )
+        else:
+            dataset.data['x_num'] = transform_num(dataset.data['x_num'], num_policy, seed)
 
     if 'x_bin' in dataset.data:
         if bin_policy is not None:
