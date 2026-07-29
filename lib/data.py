@@ -38,6 +38,12 @@ _Y_REG_DTYPE = np.float32
 _Y_CLF_DTYPE = np.int64
 _SPLIT_DTYPE = np.int32
 
+# Global variables to store feature indices after preprocessing
+# These are populated by build_dataset() and can be saved to model.pt
+FEATURE_INDICES_NUM: np.ndarray | None = None
+FEATURE_INDICES_CAT: np.ndarray | None = None
+FEATURE_INDICES_BIN: np.ndarray | None = None
+
 # NOTE
 # Split is a flat dictionary of indices, e.g. `{"train": ..., "val": ..., "test": ...}`
 type Split = dict[PartKey, np.ndarray]
@@ -715,16 +721,35 @@ def build_dataset(
             dataset, task=dataclasses.replace(dataset.task, score=Score(task_score))
         )
 
+    # Reset global feature indices
+    global FEATURE_INDICES_NUM, FEATURE_INDICES_CAT, FEATURE_INDICES_BIN
+    FEATURE_INDICES_NUM = None
+    FEATURE_INDICES_CAT = None
+    FEATURE_INDICES_BIN = None
+
     if 'x_num' in dataset.data and extract_bin_from_num:
         print('Extracting binary features from numerical...')
+        
+        # Compute binary feature indices before extraction
+        x_num_all = np.concatenate(list(dataset.data['x_num'].values()))
+        has_missing = np.any(np.isnan(x_num_all), 0)
+        unique_counts = np.array([len(np.unique(col)) for col in x_num_all.T])
+        bin_mask = (unique_counts == 2) & ~has_missing
+        bin_indices = np.nonzero(bin_mask)[0]
+        num_indices = np.nonzero(~bin_mask)[0]
+        del x_num_all, has_missing, unique_counts, bin_mask
+        
         extracted_x_bin, remaining_x_num = _extract_bin_from_num(
             dataset.data['x_num'], skip_encoder=skip_bin_encoder
         )
         if extracted_x_bin is not None:
+            # Store feature indices
+            FEATURE_INDICES_BIN = bin_indices
             if remaining_x_num is None:
                 del dataset.data['x_num']
             else:
                 dataset.data['x_num'] = remaining_x_num
+                FEATURE_INDICES_NUM = num_indices
             x_bin = dataset.data.pop('x_bin', None)
             if x_bin is None:
                 dataset.data['x_bin'] = extracted_x_bin

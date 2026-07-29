@@ -1910,6 +1910,11 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     else dataclasses.asdict(regression_label_stats)
                 ),
                 'data_config': config['data'],
+                'feature_indices': {
+                    'num': lib.data.FEATURE_INDICES_NUM,
+                    'cat': lib.data.FEATURE_INDICES_CAT,
+                    'bin': lib.data.FEATURE_INDICES_BIN,
+                },
             },
             exp / 'model.pt',
         )
