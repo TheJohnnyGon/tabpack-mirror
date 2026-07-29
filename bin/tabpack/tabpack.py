@@ -1894,6 +1894,15 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # with everything needed to rebuild `ModelPack` and reproduce the data
     # preprocessing outside of this script.
     if save_model:
+        # Extract greedy ensemble info if available
+        ensemble_info = None
+        if online_ensembles is not None and 'greedy' in online_ensembles:
+            greedy_ens = online_ensembles['greedy']
+            ensemble_info = {
+                'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
+                'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
+            }
+        
         torch.save(
             {
                 'state_dicts': saved_model_state_dicts,
@@ -1915,6 +1924,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     'cat': lib.data.FEATURE_INDICES_CAT,
                     'bin': lib.data.FEATURE_INDICES_BIN,
                 },
+                'ensemble': ensemble_info,
             },
             exp / 'model.pt',
         )

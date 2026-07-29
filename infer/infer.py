@@ -61,10 +61,18 @@ def build_dataset_with_indices(
         x_num = dataset.data['x_num']
         
         # Create binary features from stored indices
-        x_bin = {
-            k: v[:, bin_indices].astype(lib.data._X_CAT_INT_DTYPE, copy=False)
-            for k, v in x_num.items()
-        }
+        # Binary features are determined on train+val+test, so test may have non-0/1 values
+        # We need to handle this by replacing invalid values with 2 (like NaN handling)
+        x_bin = {}
+        for k, v in x_num.items():
+            bin_data = v[:, bin_indices]
+            # Replace NaN and non-0/1 values with 2
+            bin_data = np.where(
+                np.isnan(bin_data) | (bin_data != 0) & (bin_data != 1),
+                2.0,
+                bin_data
+            ).astype(lib.data._X_CAT_INT_DTYPE)
+            x_bin[k] = bin_data
         
         # Keep remaining numerical features
         if num_indices is not None and len(num_indices) > 0:
@@ -166,8 +174,14 @@ def evaluate_ensemble(
     device: torch.device,
     parts: list[str] | None = None,
     batch_size: int = 32768,
+    weights: list[float] | None = None,
 ) -> dict:
-    """Evaluate the ensemble (all pack members) and average predictions."""
+    """Evaluate the ensemble (all pack members) and average predictions.
+    
+    Args:
+        weights: Optional list of weights for each model in the ensemble.
+                 If None, simple averaging is used.
+    """
     if parts is None:
         parts = ['test']
 
@@ -191,7 +205,7 @@ def evaluate_ensemble(
 
     # Evaluate all pack members
     with torch.inference_mode():
-        result = _evaluate(
+        eval_result = _evaluate(
             apply_model_impl,
             model,
             optimizer=None,  # type: ignore
@@ -202,14 +216,28 @@ def evaluate_ensemble(
             batch_size=batch_size,
             device=device,
         )
+        # _evaluate returns tuple (result, batch_size) due to decorator
+        if isinstance(eval_result, tuple):
+            result = eval_result[0]
+        else:
+            result = eval_result
 
     # Average predictions across pack members (ensemble)
     ensemble_predictions = {}
     ensemble_metrics = {}
     for part in parts:
         # result.predictions[part] has shape (pack_size, n_samples, ...)
-        # Average over pack dimension
-        avg_pred = result.predictions[part].mean(axis=0)
+        if weights is not None:
+            # Weighted average
+            weights_array = np.array(weights)
+            weights_normalized = weights_array / weights_array.sum()
+            # Reshape weights for broadcasting: (pack_size, 1, ...)
+            weights_shape = (pack_size,) + (1,) * (result.predictions[part].ndim - 1)
+            avg_pred = (result.predictions[part] * weights_normalized.reshape(weights_shape)).sum(axis=0)
+        else:
+            # Simple average
+            avg_pred = result.predictions[part].mean(axis=0)
+        
         ensemble_predictions[part] = avg_pred
 
         # Calculate metrics for the averaged prediction
@@ -287,6 +315,36 @@ def main():
     else:
         print('  WARNING: No feature_indices in model.pt, using build_dataset directly')
 
+    # Check for ensemble info
+    ensemble_info = artifact.get('ensemble')
+    if ensemble_info and ensemble_info.get('ids'):
+        ensemble_ids = ensemble_info['ids']
+        ensemble_weights = ensemble_info.get('weights')
+        print(f'  ensemble: greedy with {len(ensemble_ids)} models')
+        print(f'    IDs: {ensemble_ids}')
+        if ensemble_weights:
+            print(f'    Weights: {ensemble_weights}')
+        
+        # Filter to only include models that are in state_dicts
+        available_ensemble_ids = [mid for mid in ensemble_ids if mid in artifact['state_dicts']]
+        if len(available_ensemble_ids) < len(ensemble_ids):
+            missing = set(ensemble_ids) - set(available_ensemble_ids)
+            print(f'  WARNING: {len(missing)} ensemble models not in state_dicts: {missing}')
+            print(f'  Using {len(available_ensemble_ids)} available ensemble models')
+        
+        # Use ensemble models instead of all saved models
+        if available_ensemble_ids:
+            model_ids = available_ensemble_ids
+            # Filter weights if they exist
+            if ensemble_weights:
+                ensemble_weights = [
+                    w for mid, w in zip(ensemble_ids, ensemble_weights)
+                    if mid in artifact['state_dicts']
+                ]
+    else:
+        print('  ensemble: None (using all saved models with simple averaging)')
+        ensemble_weights = None
+
     # Build dataset
     print(f'\nBuilding dataset...')
     if feature_indices and any(v is not None for v in feature_indices.values()):
@@ -317,6 +375,7 @@ def main():
         device,
         parts=args.parts,
         batch_size=args.batch_size,
+        weights=ensemble_weights,
     )
 
     # Print results
