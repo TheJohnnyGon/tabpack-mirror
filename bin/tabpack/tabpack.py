@@ -1323,7 +1323,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
 
     # >>> Data
     print('Loading dataset...')
-    """
+
     # Создаём DataPreprocessor с seed из конфига
     
     data_config_with_seed = {**config['data'], 'seed': config['seed']}
@@ -1337,8 +1337,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     
     # Обучаем и применяем препроцессор
     dataset = preprocessor.fit_transform(dataset)
-    """
-    dataset = lib.data.build_dataset(**config['data'])
+
     assert dataset.n_bin_features == 0
     print(f'Dataset loaded: {dataset.size("train")} train, {dataset.size("val")} val, {dataset.size("test")} test')
     regression_label_stats = dataset.try_standardize_labels_()
