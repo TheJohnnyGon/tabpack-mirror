@@ -93,6 +93,7 @@ class DataPreprocessor:
         # Вспомогательные данные
         self._bin_mask: np.ndarray | None = None
         self._unique_values_bin: list | None = None
+        self._constant_mask: np.ndarray | None = None  # Маска константных столбцов
     
     def fit(self, dataset: 'Dataset[np.ndarray]') -> 'DataPreprocessor':
         """
@@ -175,10 +176,16 @@ class DataPreprocessor:
                         random_state=self.seed,
                     )
                     # Добавляем шум для noisy-quantile
-                    X_num_train = X_num_train + np.random.RandomState(self.seed).normal(
+                    X_num_train_noisy = X_num_train + np.random.RandomState(self.seed).normal(
                         0.0, 1e-5, X_num_train.shape
                     ).astype(X_num_train.dtype)
-                    self.transformer_num.fit(X_num_train)
+                    self.transformer_num.fit(X_num_train_noisy)
+                    
+                    # Вычисляем маску константных столбцов ПОСЛЕ трансформации ОРИГИНАЛЬНЫХ данных
+                    # (как в оригинальном transform_num)
+                    X_num_train_transformed = self.transformer_num.transform(X_num_train)
+                    X_num_train_transformed = np.nan_to_num(X_num_train_transformed, copy=False)
+                    self._constant_mask = np.ptp(X_num_train_transformed, axis=0) == 0
         
         # 3. Обучение OrdinalEncoder для категориальных (на train)
         if 'x_cat' in dataset.data and self.config.get('cat_policy'):
@@ -255,20 +262,19 @@ class DataPreprocessor:
         if self.transformer_num is not None and 'x_num' in data:
             x_num_transformed = {}
             for k, v in data['x_num'].items():
-                # Для noisy-quantile добавляем шум только к train
-                if k == 'train' and isinstance(self.transformer_num, sklearn.preprocessing.QuantileTransformer):
-                    v = v + np.random.RandomState(self.seed).normal(
-                        0.0, 1e-5, v.shape
-                    ).astype(v.dtype)
-                
+                # Шум НЕ добавляем при transform (он добавляется только при fit)
                 x_num_transformed[k] = self.transformer_num.transform(v)
                 # Заменяем NaN на 0
                 x_num_transformed[k] = np.nan_to_num(x_num_transformed[k], copy=False)
             
-            # Удаляем константные столбцы
-            mask = np.ptp(x_num_transformed['train'], axis=0) != 0
-            for k in x_num_transformed:
-                x_num_transformed[k] = x_num_transformed[k][:, mask].astype(_X_NUM_DTYPE)
+            # Удаляем константные столбцы (используем сохранённую маску)
+            if self._constant_mask is not None:
+                active_mask = ~self._constant_mask
+                for k in x_num_transformed:
+                    x_num_transformed[k] = x_num_transformed[k][:, active_mask].astype(_X_NUM_DTYPE)
+            else:
+                for k in x_num_transformed:
+                    x_num_transformed[k] = x_num_transformed[k].astype(_X_NUM_DTYPE)
             
             data['x_num'] = x_num_transformed
         elif hasattr(self, '_num_transformer_params') and 'x_num' in data:
