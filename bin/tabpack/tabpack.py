@@ -1485,6 +1485,25 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     logger.debug('Prepared the global state')
 
+    # >>> Ensemble snapshots
+    # When the online ensemble improves ($), we save a complete snapshot
+    # of the ensemble state (model weights, config, feature indices, etc.)
+    # to ensure exact reproducibility during inference.
+    class EnsembleSnapshot(TypedDict):
+        ids: list[int]
+        weights: None | list[float]
+        state_dicts: dict[int, dict[str, Tensor]]
+        model_config: ConfigDict
+        feature_indices: dict[str, None | np.ndarray]
+        cat_cardinalities: list[int]
+        n_classes: None | int
+        prediction_type: str
+        regression_label_stats: None | dict[str, float]
+        data_config: KWArgs
+
+    last_ensemble_snapshot: None | EnsembleSnapshot = None
+    logger.debug('Prepared ensemble snapshot storage')
+
     # >>> Numerical logs
     #
     # Numerical log is a list of Python objects of the same type
@@ -1769,6 +1788,56 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     )
                 del ensemble_name, ensemble_report
 
+            # Save ensemble snapshot when improved ($ appears)
+            if first_online_ensemble_improved and save_model:
+                # Get the first (and typically only) online ensemble
+                first_ensemble = next(iter(online_ensembles.values()))
+                ensemble_ids = first_ensemble.ids.tolist()
+                ensemble_weights = first_ensemble.weights.tolist() if first_ensemble.weights is not None else None
+
+                # Collect state dicts for all ensemble members
+                snapshot_state_dicts: dict[int, dict[str, Tensor]] = {}
+
+                # Get current model state dict for running models
+                current_model_state_dict = model.state_dict()
+
+                for eid in ensemble_ids:
+                    # Check if model is in finished models (stopped)
+                    if eid in saved_model_state_dicts:
+                        snapshot_state_dicts[eid] = saved_model_state_dicts[eid]
+                    else:
+                        # Check if model is still running
+                        state_idx = np.where(state.ids == eid)[0]
+                        if len(state_idx) > 0:
+                            i = int(state_idx[0])
+                            # Use BEST weights (not current/latest) for running models
+                            snapshot_state_dicts[eid] = {
+                                name: value[i : i + 1].detach().cpu().clone()
+                                for name, value in state.best_model_state_dicts.items()
+                            }
+
+                last_ensemble_snapshot = EnsembleSnapshot(
+                    ids=ensemble_ids,
+                    weights=ensemble_weights,
+                    state_dicts=snapshot_state_dicts,
+                    model_config=resolved_model_config,
+                    feature_indices={
+                        'num': lib.data.FEATURE_INDICES_NUM,
+                        'cat': lib.data.FEATURE_INDICES_CAT,
+                        'bin': lib.data.FEATURE_INDICES_BIN,
+                    },
+                    cat_cardinalities=cat_cardinalities,
+                    n_classes=n_classes,
+                    prediction_type=prediction_type.value,
+                    regression_label_stats=(
+                        None
+                        if regression_label_stats is None
+                        else dataclasses.asdict(regression_label_stats)
+                    ),
+                    data_config=config['data'],
+                )
+                logger.debug(f'Saved ensemble snapshot with {len(ensemble_ids)} models')
+
         del latest_predictions, latest_predictions_torch
         _free_mps_memory()
 
@@ -1894,64 +1963,82 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # with everything needed to rebuild `ModelPack` and reproduce the data
     # preprocessing outside of this script.
     if save_model:
-        # Extract greedy ensemble info if available
-        ensemble_info = None
-        if online_ensembles is not None and 'greedy' in online_ensembles:
-            greedy_ens = online_ensembles['greedy']
+        # Use the last ensemble snapshot if available (ensures exact reproducibility)
+        if last_ensemble_snapshot is not None:
             ensemble_info = {
-                'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
-                'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
+                'ids': last_ensemble_snapshot['ids'],
+                'weights': last_ensemble_snapshot['weights'],
             }
+            state_dicts_to_save = last_ensemble_snapshot['state_dicts']
+            model_config_to_save = last_ensemble_snapshot['model_config']
+            feature_indices_to_save = last_ensemble_snapshot['feature_indices']
+            cat_cardinalities_to_save = last_ensemble_snapshot['cat_cardinalities']
+            n_classes_to_save = last_ensemble_snapshot['n_classes']
+            prediction_type_to_save = last_ensemble_snapshot['prediction_type']
+            regression_label_stats_to_save = last_ensemble_snapshot['regression_label_stats']
+            data_config_to_save = last_ensemble_snapshot['data_config']
+            logger.info(f'Using ensemble snapshot with {len(ensemble_info["ids"])} models')
+        else:
+            # Fallback: no ensemble snapshot, use original logic
+            ensemble_info = None
+            if online_ensembles is not None and 'greedy' in online_ensembles:
+                greedy_ens = online_ensembles['greedy']
+                ensemble_info = {
+                    'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
+                    'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
+                }
+                
+                # If greedy ensemble exists, save ONLY its models
+                if ensemble_info['ids'] is not None:
+                    ensemble_state_dicts = {}
+                    current_model_state_dict = model.state_dict()
+                    
+                    for greedy_id in ensemble_info['ids']:
+                        if greedy_id in saved_model_state_dicts:
+                            ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
+                        else:
+                            state_idx = np.where(state.ids == greedy_id)[0]
+                            if len(state_idx) > 0:
+                                i = int(state_idx[0])
+                                # Use BEST weights for running models
+                                ensemble_state_dicts[greedy_id] = {
+                                    name: value[i : i + 1].detach().cpu().clone()
+                                    for name, value in state.best_model_state_dicts.items()
+                                }
+                    
+                    saved_model_state_dicts.clear()
+                    saved_model_state_dicts.update(ensemble_state_dicts)
             
-            # If greedy ensemble exists, save ONLY its models
-            if ensemble_info['ids'] is not None:
-                # Create new dict with only greedy ensemble models
-                ensemble_state_dicts = {}
-                
-                # Get current model state dict for running models
-                current_model_state_dict = model.state_dict()
-                
-                for greedy_id in ensemble_info['ids']:
-                    # Check if model is in finished models (stopped)
-                    if greedy_id in saved_model_state_dicts:
-                        # Stopped models: use their best weights (already saved)
-                        ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
-                    else:
-                        # Check if model is still running
-                        state_idx = np.where(state.ids == greedy_id)[0]
-                        if len(state_idx) > 0:
-                            i = int(state_idx[0])
-                            # Running models: use their current (latest) weights
-                            ensemble_state_dicts[greedy_id] = {
-                                name: value[i : i + 1].detach().cpu().clone()
-                                for name, value in current_model_state_dict.items()
-                            }
-                
-                # Replace saved_model_state_dicts with ensemble-only version
-                saved_model_state_dicts.clear()
-                saved_model_state_dicts.update(ensemble_state_dicts)
+            state_dicts_to_save = saved_model_state_dicts
+            model_config_to_save = resolved_model_config
+            feature_indices_to_save = {
+                'num': lib.data.FEATURE_INDICES_NUM,
+                'cat': lib.data.FEATURE_INDICES_CAT,
+                'bin': lib.data.FEATURE_INDICES_BIN,
+            }
+            cat_cardinalities_to_save = cat_cardinalities
+            n_classes_to_save = n_classes
+            prediction_type_to_save = prediction_type.value
+            regression_label_stats_to_save = (
+                None
+                if regression_label_stats is None
+                else dataclasses.asdict(regression_label_stats)
+            )
+            data_config_to_save = config['data']
         
         torch.save(
             {
-                'state_dicts': saved_model_state_dicts,
+                'state_dicts': state_dicts_to_save,
                 'n_models': config['n_models'],
-                'model_config': resolved_model_config,
+                'model_config': model_config_to_save,
                 'configs': all_configs,
                 'n_num_features': dataset.n_num_features,
-                'cat_cardinalities': cat_cardinalities,
-                'n_classes': n_classes,
-                'prediction_type': prediction_type.value,
-                'regression_label_stats': (
-                    None
-                    if regression_label_stats is None
-                    else dataclasses.asdict(regression_label_stats)
-                ),
-                'data_config': config['data'],
-                'feature_indices': {
-                    'num': lib.data.FEATURE_INDICES_NUM,
-                    'cat': lib.data.FEATURE_INDICES_CAT,
-                    'bin': lib.data.FEATURE_INDICES_BIN,
-                },
+                'cat_cardinalities': cat_cardinalities_to_save,
+                'n_classes': n_classes_to_save,
+                'prediction_type': prediction_type_to_save,
+                'regression_label_stats': regression_label_stats_to_save,
+                'data_config': data_config_to_save,
+                'feature_indices': feature_indices_to_save,
                 'ensemble': ensemble_info,
             },
             exp / 'model.pt',
