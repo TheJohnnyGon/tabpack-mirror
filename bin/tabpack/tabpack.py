@@ -1492,6 +1492,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     class EnsembleSnapshot(TypedDict):
         ids: list[int]
         weights: None | list[float]
+        steps: dict[int, int]
         state_dicts: dict[int, dict[str, Tensor]]
         model_config: ConfigDict
         feature_indices: dict[str, None | np.ndarray]
@@ -1796,8 +1797,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 ensemble_ids = first_ensemble.ids.tolist()
                 ensemble_weights = first_ensemble.weights.tolist() if first_ensemble.weights is not None else None
 
-                # Collect state dicts for all ensemble members
+                # Collect state dicts and steps for all ensemble members
                 snapshot_state_dicts: dict[int, dict[str, Tensor]] = {}
+                snapshot_steps: dict[int, int] = {}
 
                 # Get current model state dict for running models
                 current_model_state_dict = model.state_dict()
@@ -1806,6 +1808,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     # Check if model is in finished models (stopped)
                     if eid in saved_model_state_dicts:
                         snapshot_state_dicts[eid] = saved_model_state_dicts[eid]
+                        # Get step from final_state
+                        final_idx = np.where(final_state.ids == eid)[0]
+                        if len(final_idx) > 0:
+                            snapshot_steps[eid] = int(final_state.steps[final_idx[0]])
                     else:
                         # Check if model is still running
                         state_idx = np.where(state.ids == eid)[0]
@@ -1816,10 +1822,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                                 name: value[i : i + 1].detach().cpu().clone()
                                 for name, value in state.best_model_state_dicts.items()
                             }
+                            # Get best step from state
+                            snapshot_steps[eid] = int(state.best_steps[i])
 
                 last_ensemble_snapshot = EnsembleSnapshot(
                     ids=ensemble_ids,
                     weights=ensemble_weights,
+                    steps=snapshot_steps,
                     state_dicts=snapshot_state_dicts,
                     model_config=resolved_model_config,
                     feature_indices={
@@ -1974,6 +1983,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             ensemble_info = {
                 'ids': last_ensemble_snapshot['ids'],
                 'weights': last_ensemble_snapshot['weights'],
+                'steps': last_ensemble_snapshot['steps'],
             }
             state_dicts_to_save = last_ensemble_snapshot['state_dicts']
             model_config_to_save = last_ensemble_snapshot['model_config']
@@ -1993,16 +2003,22 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 ensemble_info = {
                     'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
                     'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
+                    'steps': {},
                 }
                 
                 # If greedy ensemble exists, save ONLY its models
                 if ensemble_info['ids'] is not None:
                     ensemble_state_dicts = {}
+                    ensemble_steps = {}
                     current_model_state_dict = model.state_dict()
                     
                     for greedy_id in ensemble_info['ids']:
                         if greedy_id in saved_model_state_dicts:
                             ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
+                            # Get step from final_state
+                            final_idx = np.where(final_state.ids == greedy_id)[0]
+                            if len(final_idx) > 0:
+                                ensemble_steps[greedy_id] = int(final_state.steps[final_idx[0]])
                         else:
                             state_idx = np.where(state.ids == greedy_id)[0]
                             if len(state_idx) > 0:
@@ -2012,7 +2028,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                                     name: value[i : i + 1].detach().cpu().clone()
                                     for name, value in state.best_model_state_dicts.items()
                                 }
+                                # Get best step from state
+                                ensemble_steps[greedy_id] = int(state.best_steps[i])
                     
+                    ensemble_info['steps'] = ensemble_steps
                     saved_model_state_dicts.clear()
                     saved_model_state_dicts.update(ensemble_state_dicts)
             
