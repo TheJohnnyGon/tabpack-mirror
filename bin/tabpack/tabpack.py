@@ -1485,6 +1485,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     logger.debug('Prepared the global state')
 
+    # >>> Ensemble snapshot storage
+    # When the online ensemble improves ($), we save a snapshot of the ensemble
+    # state (model weights, steps) to ensure exact reproducibility during inference.
+    # This is necessary because for update_type='latest', the ensemble is built on
+    # predictions from a specific moment, and weights continue to change after that.
+    last_ensemble_snapshot: None | dict = None
+    logger.debug('Prepared ensemble snapshot storage')
+
     # >>> Numerical logs
     #
     # Numerical log is a list of Python objects of the same type
@@ -1769,6 +1777,50 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     )
                 del ensemble_name, ensemble_report
 
+            # Save ensemble snapshot when improved ($ appears)
+            # This is necessary for update_type='latest' because the ensemble is built
+            # on predictions from a specific moment, and weights continue to change.
+            if first_online_ensemble_improved and save_model:
+                first_ensemble = next(iter(online_ensembles.values()))
+                ensemble_ids = first_ensemble.ids.tolist()
+                ensemble_weights = first_ensemble.weights.tolist() if first_ensemble.weights is not None else None
+                ensemble_steps_list = first_ensemble.steps.tolist()
+                update_type = first_ensemble._update_type
+
+                snapshot_state_dicts: dict[int, dict[str, Tensor]] = {}
+                snapshot_steps: dict[int, int] = {}
+                current_model_state_dict = model.state_dict()
+
+                for idx, eid in enumerate(ensemble_ids):
+                    snapshot_steps[eid] = int(ensemble_steps_list[idx])
+
+                    if eid in saved_model_state_dicts:
+                        # Finished model - use saved weights
+                        snapshot_state_dicts[eid] = saved_model_state_dicts[eid]
+                    else:
+                        # Running model
+                        state_idx = np.where(state.ids == eid)[0]
+                        if len(state_idx) > 0:
+                            i = int(state_idx[0])
+                            if update_type == 'latest':
+                                # Use CURRENT weights for 'latest' update type
+                                state_dict_to_use = current_model_state_dict
+                            else:
+                                # Use BEST weights for 'best' or 'final' update types
+                                state_dict_to_use = state.best_model_state_dicts
+                            
+                            snapshot_state_dicts[eid] = {
+                                name: value[i : i + 1].detach().cpu().clone()
+                                for name, value in state_dict_to_use.items()
+                            }
+
+                last_ensemble_snapshot = {
+                    'ids': ensemble_ids,
+                    'weights': ensemble_weights,
+                    'steps': snapshot_steps,
+                    'state_dicts': snapshot_state_dicts,
+                }
+                logger.debug(f'Saved ensemble snapshot with {len(ensemble_ids)} models')
 
         del latest_predictions, latest_predictions_torch
         _free_mps_memory()
@@ -1895,56 +1947,67 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # with everything needed to rebuild `ModelPack` and reproduce the data
     # preprocessing outside of this script.
     if save_model:
-        ensemble_info = None
-        if online_ensembles is not None and 'greedy' in online_ensembles:
-            greedy_ens = online_ensembles['greedy']
-            update_type = greedy_ens._update_type
+        # Use the last ensemble snapshot if available (ensures exact reproducibility)
+        if last_ensemble_snapshot is not None:
             ensemble_info = {
-                'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
-                'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
-                'steps': {},
+                'ids': last_ensemble_snapshot['ids'],
+                'weights': last_ensemble_snapshot['weights'],
+                'steps': last_ensemble_snapshot['steps'],
             }
+            state_dicts_to_save = last_ensemble_snapshot['state_dicts']
+            logger.info(f'Using ensemble snapshot with {len(ensemble_info["ids"])} models')
+        else:
+            # Fallback: no ensemble snapshot
+            ensemble_info = None
+            if online_ensembles is not None and 'greedy' in online_ensembles:
+                greedy_ens = online_ensembles['greedy']
+                update_type = greedy_ens._update_type
+                ensemble_info = {
+                    'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
+                    'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
+                    'steps': {},
+                }
+                
+                # If greedy ensemble exists, save ONLY its models
+                if ensemble_info['ids'] is not None:
+                    ensemble_state_dicts = {}
+                    ensemble_steps = {}
+                    current_model_state_dict = model.state_dict()
+                    
+                    for idx, greedy_id in enumerate(ensemble_info['ids']):
+                        if greedy_id in saved_model_state_dicts:
+                            # Finished model - use saved weights
+                            ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
+                            # Get step from final_state
+                            final_idx = np.where(final_state.ids == greedy_id)[0]
+                            if len(final_idx) > 0:
+                                ensemble_steps[greedy_id] = int(final_state.steps[final_idx[0]])
+                        else:
+                            # Running model
+                            state_idx = np.where(state.ids == greedy_id)[0]
+                            if len(state_idx) > 0:
+                                i = int(state_idx[0])
+                                # Choose weights based on update_type
+                                if update_type == 'latest':
+                                    # Use CURRENT weights for 'latest' update type
+                                    state_dict_to_use = current_model_state_dict
+                                    step_to_use = int(state.steps[i])
+                                else:
+                                    # Use BEST weights for 'best' or 'final' update types
+                                    state_dict_to_use = state.best_model_state_dicts
+                                    step_to_use = int(state.best_steps[i])
+                                
+                                ensemble_state_dicts[greedy_id] = {
+                                    name: value[i : i + 1].detach().cpu().clone()
+                                    for name, value in state_dict_to_use.items()
+                                }
+                                ensemble_steps[greedy_id] = step_to_use
+                    
+                    ensemble_info['steps'] = ensemble_steps
+                    saved_model_state_dicts.clear()
+                    saved_model_state_dicts.update(ensemble_state_dicts)
             
-            # If greedy ensemble exists, save ONLY its models
-            if ensemble_info['ids'] is not None:
-                ensemble_state_dicts = {}
-                ensemble_steps = {}
-                current_model_state_dict = model.state_dict()
-                
-                for idx, greedy_id in enumerate(ensemble_info['ids']):
-                    if greedy_id in saved_model_state_dicts:
-                        # Finished model - use saved weights
-                        ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
-                        # Get step from final_state
-                        final_idx = np.where(final_state.ids == greedy_id)[0]
-                        if len(final_idx) > 0:
-                            ensemble_steps[greedy_id] = int(final_state.steps[final_idx[0]])
-                    else:
-                        # Running model
-                        state_idx = np.where(state.ids == greedy_id)[0]
-                        if len(state_idx) > 0:
-                            i = int(state_idx[0])
-                            # Choose weights based on update_type
-                            if update_type == 'latest':
-                                # Use CURRENT weights for 'latest' update type
-                                state_dict_to_use = current_model_state_dict
-                                step_to_use = int(state.steps[i])
-                            else:
-                                # Use BEST weights for 'best' or 'final' update types
-                                state_dict_to_use = state.best_model_state_dicts
-                                step_to_use = int(state.best_steps[i])
-                            
-                            ensemble_state_dicts[greedy_id] = {
-                                name: value[i : i + 1].detach().cpu().clone()
-                                for name, value in state_dict_to_use.items()
-                            }
-                            ensemble_steps[greedy_id] = step_to_use
-                
-                ensemble_info['steps'] = ensemble_steps
-                saved_model_state_dicts.clear()
-                saved_model_state_dicts.update(ensemble_state_dicts)
-        
-        state_dicts_to_save = saved_model_state_dicts
+            state_dicts_to_save = saved_model_state_dicts
         model_config_to_save = resolved_model_config
         feature_indices_to_save = {
             'num': lib.data.FEATURE_INDICES_NUM,
