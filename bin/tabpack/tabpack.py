@@ -1796,6 +1796,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 first_ensemble = next(iter(online_ensembles.values()))
                 ensemble_ids = first_ensemble.ids.tolist()
                 ensemble_weights = first_ensemble.weights.tolist() if first_ensemble.weights is not None else None
+                ensemble_steps_list = first_ensemble.steps.tolist()
 
                 # Collect state dicts and steps for all ensemble members
                 snapshot_state_dicts: dict[int, dict[str, Tensor]] = {}
@@ -1804,26 +1805,34 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 # Get current model state dict for running models
                 current_model_state_dict = model.state_dict()
 
-                for eid in ensemble_ids:
+                # Determine which weights to save based on update_type
+                update_type = first_ensemble._update_type
+
+                for idx, eid in enumerate(ensemble_ids):
+                    # Get the step from ensemble (this is the correct step for this ensemble member)
+                    snapshot_steps[eid] = int(ensemble_steps_list[idx])
+
                     # Check if model is in finished models (stopped)
                     if eid in saved_model_state_dicts:
+                        # For finished models, we always have best weights saved
                         snapshot_state_dicts[eid] = saved_model_state_dicts[eid]
-                        # Get step from final_state
-                        final_idx = np.where(final_state.ids == eid)[0]
-                        if len(final_idx) > 0:
-                            snapshot_steps[eid] = int(final_state.steps[final_idx[0]])
                     else:
                         # Check if model is still running
                         state_idx = np.where(state.ids == eid)[0]
                         if len(state_idx) > 0:
                             i = int(state_idx[0])
-                            # Use BEST weights (not current/latest) for running models
+                            # Choose weights based on update_type
+                            if update_type == 'latest':
+                                # Use current weights for 'latest' update type
+                                state_dict_to_use = current_model_state_dict
+                            else:
+                                # Use best weights for 'best' or 'final' update types
+                                state_dict_to_use = state.best_model_state_dicts
+                            
                             snapshot_state_dicts[eid] = {
                                 name: value[i : i + 1].detach().cpu().clone()
-                                for name, value in state.best_model_state_dicts.items()
+                                for name, value in state_dict_to_use.items()
                             }
-                            # Get best step from state
-                            snapshot_steps[eid] = int(state.best_steps[i])
 
                 last_ensemble_snapshot = EnsembleSnapshot(
                     ids=ensemble_ids,
