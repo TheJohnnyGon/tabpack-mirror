@@ -416,7 +416,7 @@ class StatePack:
                 for key, value in model_state_dict.items():
                     self.best_model_state_dicts[key][improved_pack_idx_torch] = value[
                         improved_pack_idx_torch
-                    ]
+                    ].clone()
             self.n_consequtive_bad_updates[~improved_mask] += 1
 
         else:
@@ -1485,27 +1485,6 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     logger.debug('Prepared the global state')
 
-    # >>> Ensemble snapshots
-    # When the online ensemble improves ($), we save a complete snapshot
-    # of the ensemble state (model weights, config, feature indices, etc.)
-    # to ensure exact reproducibility during inference.
-    class EnsembleSnapshot(TypedDict):
-        ids: list[int]
-        weights: None | list[float]
-        steps: dict[int, int]
-        state_dicts: dict[int, dict[str, Tensor]]
-        model_config: ConfigDict
-        feature_indices: dict[str, None | np.ndarray]
-        cat_cardinalities: list[int]
-        n_classes: None | int
-        prediction_type: str
-        regression_label_stats: None | dict[str, float]
-        data_config: KWArgs
-        transformers: dict[str, Any]
-
-    last_ensemble_snapshot: None | EnsembleSnapshot = None
-    logger.debug('Prepared ensemble snapshot storage')
-
     # >>> Numerical logs
     #
     # Numerical log is a list of Python objects of the same type
@@ -1790,77 +1769,6 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     )
                 del ensemble_name, ensemble_report
 
-            # Save ensemble snapshot when improved ($ appears)
-            if first_online_ensemble_improved and save_model:
-                # Get the first (and typically only) online ensemble
-                first_ensemble = next(iter(online_ensembles.values()))
-                ensemble_ids = first_ensemble.ids.tolist()
-                ensemble_weights = first_ensemble.weights.tolist() if first_ensemble.weights is not None else None
-                ensemble_steps_list = first_ensemble.steps.tolist()
-
-                # Collect state dicts and steps for all ensemble members
-                snapshot_state_dicts: dict[int, dict[str, Tensor]] = {}
-                snapshot_steps: dict[int, int] = {}
-
-                # Get current model state dict for running models
-                current_model_state_dict = model.state_dict()
-
-                # Determine which weights to save based on update_type
-                update_type = first_ensemble._update_type
-
-                for idx, eid in enumerate(ensemble_ids):
-                    # Get the step from ensemble (this is the correct step for this ensemble member)
-                    snapshot_steps[eid] = int(ensemble_steps_list[idx])
-
-                    # Check if model is in finished models (stopped)
-                    if eid in saved_model_state_dicts:
-                        # For finished models, we always have best weights saved
-                        snapshot_state_dicts[eid] = saved_model_state_dicts[eid]
-                    else:
-                        # Check if model is still running
-                        state_idx = np.where(state.ids == eid)[0]
-                        if len(state_idx) > 0:
-                            i = int(state_idx[0])
-                            # Choose weights based on update_type
-                            if update_type == 'latest':
-                                # Use current weights for 'latest' update type
-                                state_dict_to_use = current_model_state_dict
-                            else:
-                                # Use best weights for 'best' or 'final' update types
-                                state_dict_to_use = state.best_model_state_dicts
-                            
-                            snapshot_state_dicts[eid] = {
-                                name: value[i : i + 1].detach().cpu().clone()
-                                for name, value in state_dict_to_use.items()
-                            }
-
-                last_ensemble_snapshot = EnsembleSnapshot(
-                    ids=ensemble_ids,
-                    weights=ensemble_weights,
-                    steps=snapshot_steps,
-                    state_dicts=snapshot_state_dicts,
-                    model_config=resolved_model_config,
-                    feature_indices={
-                        'num': lib.data.FEATURE_INDICES_NUM,
-                        'cat': lib.data.FEATURE_INDICES_CAT,
-                        'bin': lib.data.FEATURE_INDICES_BIN,
-                    },
-                    cat_cardinalities=cat_cardinalities,
-                    n_classes=n_classes,
-                    prediction_type=prediction_type.value,
-                    regression_label_stats=(
-                        None
-                        if regression_label_stats is None
-                        else dataclasses.asdict(regression_label_stats)
-                    ),
-                    data_config=config['data'],
-                    transformers={
-                        'num': lib.data.TRANSFORMER_NUM,
-                        'cat_ordinal': lib.data.TRANSFORMER_CAT_ORDINAL,
-                        'cat_onehot': lib.data.TRANSFORMER_CAT_ONEHOT,
-                    },
-                )
-                logger.debug(f'Saved ensemble snapshot with {len(ensemble_ids)} models')
 
         del latest_predictions, latest_predictions_torch
         _free_mps_memory()
@@ -1987,84 +1895,64 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # with everything needed to rebuild `ModelPack` and reproduce the data
     # preprocessing outside of this script.
     if save_model:
-        # Use the last ensemble snapshot if available (ensures exact reproducibility)
-        if last_ensemble_snapshot is not None:
+        ensemble_info = None
+        if online_ensembles is not None and 'greedy' in online_ensembles:
+            greedy_ens = online_ensembles['greedy']
             ensemble_info = {
-                'ids': last_ensemble_snapshot['ids'],
-                'weights': last_ensemble_snapshot['weights'],
-                'steps': last_ensemble_snapshot['steps'],
+                'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
+                'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
+                'steps': {},
             }
-            state_dicts_to_save = last_ensemble_snapshot['state_dicts']
-            model_config_to_save = last_ensemble_snapshot['model_config']
-            feature_indices_to_save = last_ensemble_snapshot['feature_indices']
-            cat_cardinalities_to_save = last_ensemble_snapshot['cat_cardinalities']
-            n_classes_to_save = last_ensemble_snapshot['n_classes']
-            prediction_type_to_save = last_ensemble_snapshot['prediction_type']
-            regression_label_stats_to_save = last_ensemble_snapshot['regression_label_stats']
-            data_config_to_save = last_ensemble_snapshot['data_config']
-            transformers_to_save = last_ensemble_snapshot['transformers']
-            logger.info(f'Using ensemble snapshot with {len(ensemble_info["ids"])} models')
-        else:
-            # Fallback: no ensemble snapshot, use original logic
-            ensemble_info = None
-            if online_ensembles is not None and 'greedy' in online_ensembles:
-                greedy_ens = online_ensembles['greedy']
-                ensemble_info = {
-                    'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
-                    'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
-                    'steps': {},
-                }
-                
-                # If greedy ensemble exists, save ONLY its models
-                if ensemble_info['ids'] is not None:
-                    ensemble_state_dicts = {}
-                    ensemble_steps = {}
-                    current_model_state_dict = model.state_dict()
-                    
-                    for greedy_id in ensemble_info['ids']:
-                        if greedy_id in saved_model_state_dicts:
-                            ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
-                            # Get step from final_state
-                            final_idx = np.where(final_state.ids == greedy_id)[0]
-                            if len(final_idx) > 0:
-                                ensemble_steps[greedy_id] = int(final_state.steps[final_idx[0]])
-                        else:
-                            state_idx = np.where(state.ids == greedy_id)[0]
-                            if len(state_idx) > 0:
-                                i = int(state_idx[0])
-                                # Use BEST weights for running models
-                                ensemble_state_dicts[greedy_id] = {
-                                    name: value[i : i + 1].detach().cpu().clone()
-                                    for name, value in state.best_model_state_dicts.items()
-                                }
-                                # Get best step from state
-                                ensemble_steps[greedy_id] = int(state.best_steps[i])
-                    
-                    ensemble_info['steps'] = ensemble_steps
-                    saved_model_state_dicts.clear()
-                    saved_model_state_dicts.update(ensemble_state_dicts)
             
-            state_dicts_to_save = saved_model_state_dicts
-            model_config_to_save = resolved_model_config
-            feature_indices_to_save = {
-                'num': lib.data.FEATURE_INDICES_NUM,
-                'cat': lib.data.FEATURE_INDICES_CAT,
-                'bin': lib.data.FEATURE_INDICES_BIN,
-            }
-            cat_cardinalities_to_save = cat_cardinalities
-            n_classes_to_save = n_classes
-            prediction_type_to_save = prediction_type.value
-            regression_label_stats_to_save = (
-                None
-                if regression_label_stats is None
-                else dataclasses.asdict(regression_label_stats)
-            )
-            data_config_to_save = config['data']
-            transformers_to_save = {
-                'num': lib.data.TRANSFORMER_NUM,
-                'cat_ordinal': lib.data.TRANSFORMER_CAT_ORDINAL,
-                'cat_onehot': lib.data.TRANSFORMER_CAT_ONEHOT,
-            }
+            # If greedy ensemble exists, save ONLY its models
+            if ensemble_info['ids'] is not None:
+                ensemble_state_dicts = {}
+                ensemble_steps = {}
+                
+                for greedy_id in ensemble_info['ids']:
+                    if greedy_id in saved_model_state_dicts:
+                        ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
+                        # Get step from final_state
+                        final_idx = np.where(final_state.ids == greedy_id)[0]
+                        if len(final_idx) > 0:
+                            ensemble_steps[greedy_id] = int(final_state.steps[final_idx[0]])
+                    else:
+                        state_idx = np.where(state.ids == greedy_id)[0]
+                        if len(state_idx) > 0:
+                            i = int(state_idx[0])
+                            # Use BEST weights for running models
+                            ensemble_state_dicts[greedy_id] = {
+                                name: value[i : i + 1].detach().cpu().clone()
+                                for name, value in state.best_model_state_dicts.items()
+                            }
+                            # Get best step from state
+                            ensemble_steps[greedy_id] = int(state.best_steps[i])
+                
+                ensemble_info['steps'] = ensemble_steps
+                saved_model_state_dicts.clear()
+                saved_model_state_dicts.update(ensemble_state_dicts)
+        
+        state_dicts_to_save = saved_model_state_dicts
+        model_config_to_save = resolved_model_config
+        feature_indices_to_save = {
+            'num': lib.data.FEATURE_INDICES_NUM,
+            'cat': lib.data.FEATURE_INDICES_CAT,
+            'bin': lib.data.FEATURE_INDICES_BIN,
+        }
+        cat_cardinalities_to_save = cat_cardinalities
+        n_classes_to_save = n_classes
+        prediction_type_to_save = prediction_type.value
+        regression_label_stats_to_save = (
+            None
+            if regression_label_stats is None
+            else dataclasses.asdict(regression_label_stats)
+        )
+        data_config_to_save = config['data']
+        transformers_to_save = {
+            'num': lib.data.TRANSFORMER_NUM,
+            'cat_ordinal': lib.data.TRANSFORMER_CAT_ORDINAL,
+            'cat_onehot': lib.data.TRANSFORMER_CAT_ONEHOT,
+        }
         
         torch.save(
             {
