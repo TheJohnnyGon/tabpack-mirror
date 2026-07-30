@@ -408,15 +408,15 @@ class StatePack:
                 for part in self.best_predictions:
                     self.best_predictions[part][improved_pack_idx] = predictions[part][
                         improved_pack_idx
-                    ].copy()
+                    ]
                 for part in self.best_predictions_torch:
                     self.best_predictions_torch[part][improved_pack_idx_torch] = (
-                        predictions_torch[part][improved_pack_idx_torch].clone()
+                        predictions_torch[part][improved_pack_idx_torch]
                     )
                 for key, value in model_state_dict.items():
                     self.best_model_state_dicts[key][improved_pack_idx_torch] = value[
                         improved_pack_idx_torch
-                    ].clone()
+                    ]
             self.n_consequtive_bad_updates[~improved_mask] += 1
 
         else:
