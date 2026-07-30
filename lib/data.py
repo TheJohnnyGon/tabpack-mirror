@@ -113,10 +113,14 @@ class DataPreprocessor:
             self.feature_indices_bin = np.nonzero(bin_mask)[0]
             self.feature_indices_num = np.nonzero(~bin_mask)[0]
         
-        # 2. Обучение QuantileTransformer/StandardScaler (на train)
+        # 2. Обучение QuantileTransformer/StandardScaler (на train, ПОСЛЕ извлечения бинарных)
         if 'x_num' in dataset.data and self.config.get('num_policy'):
             num_policy = NumPolicy(self.config['num_policy'])
-            X_num_train = dataset.data['x_num']['train']
+            # Если извлекали бинарные признаки, используем только оставшиеся числовые
+            if self.feature_indices_num is not None:
+                X_num_train = dataset.data['x_num']['train'][:, self.feature_indices_num]
+            else:
+                X_num_train = dataset.data['x_num']['train']
             
             if num_policy == NumPolicy.STANDARD:
                 self.transformer_num = sklearn.preprocessing.StandardScaler()
