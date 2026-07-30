@@ -83,11 +83,16 @@ class DataPreprocessor:
         
         # Трансформеры
         self.transformer_num: sklearn.preprocessing.StandardScaler | sklearn.preprocessing.QuantileTransformer | None = None
+        self.transformer_bin_ordinal: sklearn.preprocessing.OrdinalEncoder | None = None
         self.transformer_cat_ordinal: sklearn.preprocessing.OrdinalEncoder | None = None
         self.transformer_cat_onehot: sklearn.preprocessing.OneHotEncoder | None = None
         
         # Флаг обучения
         self._fitted = False
+        
+        # Вспомогательные данные
+        self._bin_mask: np.ndarray | None = None
+        self._unique_values_bin: list | None = None
     
     def fit(self, dataset: 'Dataset[np.ndarray]') -> 'DataPreprocessor':
         """
@@ -95,7 +100,8 @@ class DataPreprocessor:
         
         - Бинарные индексы: вычисляются на ВСЕХ данных (train+val+test)
         - QuantileTransformer/StandardScaler: обучается на train
-        - OrdinalEncoder: обучается на train
+        - OrdinalEncoder для бинарных: обучается на train (если не skip_bin_encoder)
+        - OrdinalEncoder для категориальных: обучается на train
         - OneHotEncoder: обучается на train
         
         Args:
@@ -108,10 +114,26 @@ class DataPreprocessor:
         if 'x_num' in dataset.data and self.config.get('extract_bin_from_num'):
             x_num_all = np.concatenate(list(dataset.data['x_num'].values()))
             has_missing = np.any(np.isnan(x_num_all), 0)
-            unique_counts = np.array([len(np.unique(col)) for col in x_num_all.T])
+            unique_values = [np.unique(x) for x in x_num_all.T]
+            unique_counts = np.array([len(x) for x in unique_values])
             bin_mask = (unique_counts == 2) & ~has_missing
             self.feature_indices_bin = np.nonzero(bin_mask)[0]
             self.feature_indices_num = np.nonzero(~bin_mask)[0]
+            self._bin_mask = bin_mask
+            
+            # Проверяем, все ли бинарные столбцы содержат только 0/1
+            skip_encoder = self.config.get('skip_bin_encoder', False)
+            is_01 = all(
+                set(unique_values[i]) == {0.0, 1.0} for i in self.feature_indices_bin
+            )
+            
+            # Если не skip_encoder или не все столбцы 0/1, создаём OrdinalEncoder
+            if not (skip_encoder and is_01) and len(self.feature_indices_bin) > 0:
+                self._unique_values_bin = [unique_values[i] for i in self.feature_indices_bin]
+                self.transformer_bin_ordinal = sklearn.preprocessing.OrdinalEncoder(
+                    categories=self._unique_values_bin
+                )
+                self.transformer_bin_ordinal.fit(dataset.data['x_num']['train'][:, self.feature_indices_bin])
         
         # 2. Обучение QuantileTransformer/StandardScaler (на train, ПОСЛЕ извлечения бинарных)
         if 'x_num' in dataset.data and self.config.get('num_policy'):
@@ -124,21 +146,41 @@ class DataPreprocessor:
             
             if num_policy == NumPolicy.STANDARD:
                 self.transformer_num = sklearn.preprocessing.StandardScaler()
+                self.transformer_num.fit(X_num_train)
             elif num_policy == NumPolicy.NOISY_QUANTILE:
-                self.transformer_num = sklearn.preprocessing.QuantileTransformer(
-                    n_quantiles=max(min(X_num_train.shape[0] // 30, 1000), 10),
-                    output_distribution='normal',
-                    subsample=1_000_000_000,
-                    random_state=self.seed,
-                )
-                # Добавляем шум для noisy-quantile
-                X_num_train = X_num_train + np.random.RandomState(self.seed).normal(
-                    0.0, 1e-5, X_num_train.shape
-                ).astype(X_num_train.dtype)
-            
-            self.transformer_num.fit(X_num_train)
+                # Для noisy-quantile используем columnwise трансформацию если memory_efficient
+                if self.config.get('num_memory_efficient', False):
+                    # Сохраняем параметры для columnwise трансформации
+                    self._num_transformer_params = []
+                    n_rows, n_cols = X_num_train.shape
+                    for col_in in range(n_cols):
+                        train_col = X_num_train[:, col_in]
+                        fit_data = train_col.copy()
+                        noise = np.random.RandomState(self.seed + col_in).normal(
+                            0.0, 1e-5, fit_data.shape
+                        ).astype(fit_data.dtype)
+                        fit_data += noise
+                        normalizer = sklearn.preprocessing.QuantileTransformer(
+                            n_quantiles=max(min(n_rows // 30, 1000), 10),
+                            output_distribution='normal',
+                            random_state=self.seed,
+                        )
+                        normalizer.fit(fit_data.reshape(-1, 1))
+                        self._num_transformer_params.append(normalizer)
+                else:
+                    self.transformer_num = sklearn.preprocessing.QuantileTransformer(
+                        n_quantiles=max(min(X_num_train.shape[0] // 30, 1000), 10),
+                        output_distribution='normal',
+                        subsample=1_000_000_000,
+                        random_state=self.seed,
+                    )
+                    # Добавляем шум для noisy-quantile
+                    X_num_train = X_num_train + np.random.RandomState(self.seed).normal(
+                        0.0, 1e-5, X_num_train.shape
+                    ).astype(X_num_train.dtype)
+                    self.transformer_num.fit(X_num_train)
         
-        # 3. Обучение OrdinalEncoder (на train)
+        # 3. Обучение OrdinalEncoder для категориальных (на train)
         if 'x_cat' in dataset.data and self.config.get('cat_policy'):
             unknown_value = np.iinfo('int64').max - 3
             self.transformer_cat_ordinal = sklearn.preprocessing.OrdinalEncoder(
@@ -169,8 +211,9 @@ class DataPreprocessor:
         
         - Извлекает бинарные признаки по сохранённым индексам
         - Применяет QuantileTransformer/StandardScaler ко всем частям
-        - Применяет OrdinalEncoder ко всем частям
-        - Применяет OneHotEncoder ко всем частям (если нужно)
+        - Применяет OrdinalEncoder для бинарных (если использовался)
+        - Применяет OrdinalEncoder для категориальных
+        - Применяет OneHotEncoder (если нужно)
         
         Args:
             dataset: Датасет с train/val/test частями
@@ -187,9 +230,18 @@ class DataPreprocessor:
         if self.feature_indices_bin is not None and 'x_num' in data:
             x_bin = {}
             x_num_remaining = {}
-            for k, v in data['x_num'].items():
-                x_bin[k] = v[:, self.feature_indices_bin].astype(_X_CAT_INT_DTYPE)
-                x_num_remaining[k] = v[:, self.feature_indices_num]
+            
+            # Проверяем, использовали ли мы OrdinalEncoder для бинарных
+            if self.transformer_bin_ordinal is not None:
+                # Используем OrdinalEncoder
+                for k, v in data['x_num'].items():
+                    x_bin[k] = self.transformer_bin_ordinal.transform(v[:, self.feature_indices_bin]).astype(bool)
+                    x_num_remaining[k] = v[:, self.feature_indices_num]
+            else:
+                # Прямой каст (skip_bin_encoder=True и все столбцы 0/1)
+                for k, v in data['x_num'].items():
+                    x_bin[k] = v[:, self.feature_indices_bin].astype(_X_CAT_INT_DTYPE)
+                    x_num_remaining[k] = v[:, self.feature_indices_num]
             
             # Объединяем с существующими x_bin
             if 'x_bin' in data:
@@ -219,6 +271,35 @@ class DataPreprocessor:
                 x_num_transformed[k] = x_num_transformed[k][:, mask].astype(_X_NUM_DTYPE)
             
             data['x_num'] = x_num_transformed
+        elif hasattr(self, '_num_transformer_params') and 'x_num' in data:
+            # Columnwise трансформация для memory_efficient
+            x_num_transformed = {}
+            n_cols = len(self._num_transformer_params)
+            parts = list(data['x_num'].keys())
+            
+            # Определяем константные столбцы
+            constant_mask = np.ptp(data['x_num']['train'], axis=0) == 0
+            active_cols = np.nonzero(~constant_mask)[0]
+            n_active = len(active_cols)
+            
+            for k in parts:
+                x_num_transformed[k] = np.empty((len(data['x_num'][k]), n_active), dtype=_X_NUM_DTYPE)
+            
+            col_out = 0
+            for col_in in range(n_cols):
+                if constant_mask[col_in]:
+                    continue
+                
+                normalizer = self._num_transformer_params[col_in]
+                for k in parts:
+                    part_col = data['x_num'][k][:, col_in]
+                    transformed = normalizer.transform(part_col.reshape(-1, 1)).astype(_X_NUM_DTYPE).ravel()
+                    transformed = np.nan_to_num(transformed, copy=False)
+                    x_num_transformed[k][:, col_out] = transformed
+                
+                col_out += 1
+            
+            data['x_num'] = x_num_transformed
         
         # 3. Применение bin_policy (convert-to-cat)
         if 'x_bin' in data and self.config.get('bin_policy') == 'convert-to-cat':
@@ -231,7 +312,7 @@ class DataPreprocessor:
                     x_bin_as_cat = x_bin[k].astype(data['x_cat'][k].dtype)
                     data['x_cat'][k] = np.column_stack([data['x_cat'][k], x_bin_as_cat])
         
-        # 4. Применение OrdinalEncoder
+        # 4. Применение OrdinalEncoder для категориальных
         if self.transformer_cat_ordinal is not None and 'x_cat' in data:
             x_cat_encoded = {}
             for k, v in data['x_cat'].items():
