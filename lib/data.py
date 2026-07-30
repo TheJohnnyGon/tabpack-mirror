@@ -50,6 +50,222 @@ TRANSFORMER_NUM: sklearn.preprocessing.StandardScaler | sklearn.preprocessing.Qu
 TRANSFORMER_CAT_ORDINAL: sklearn.preprocessing.OrdinalEncoder | None = None
 TRANSFORMER_CAT_ONEHOT: sklearn.preprocessing.OneHotEncoder | None = None
 
+
+class DataPreprocessor:
+    """
+    Препроцессор данных с паттерном fit/transform.
+    
+    Обучает трансформеры на train данных и применяет их ко всем частям.
+    Сохраняет индексы признаков и обученные трансформеры для последующего использования.
+    """
+    
+    def __init__(self, config: dict):
+        """
+        Инициализация препроцессора.
+        
+        Args:
+            config: Конфигурация с параметрами:
+                - seed: случайное зерно для воспроизводимости
+                - extract_bin_from_num: извлекать ли бинарные признаки из числовых
+                - skip_bin_encoder: пропускать ли OrdinalEncoder для бинарных
+                - num_policy: политика трансформации числовых признаков
+                - num_memory_efficient: использовать ли memory-efficient трансформацию
+                - bin_policy: политика обработки бинарных признаков
+                - cat_policy: политика обработки категориальных признаков
+        """
+        self.config = config
+        self.seed = config.get('seed', 0)
+        
+        # Индексы признаков
+        self.feature_indices_num: np.ndarray | None = None
+        self.feature_indices_bin: np.ndarray | None = None
+        self.feature_indices_cat: np.ndarray | None = None
+        
+        # Трансформеры
+        self.transformer_num: sklearn.preprocessing.StandardScaler | sklearn.preprocessing.QuantileTransformer | None = None
+        self.transformer_cat_ordinal: sklearn.preprocessing.OrdinalEncoder | None = None
+        self.transformer_cat_onehot: sklearn.preprocessing.OneHotEncoder | None = None
+        
+        # Флаг обучения
+        self._fitted = False
+    
+    def fit(self, dataset: 'Dataset[np.ndarray]') -> 'DataPreprocessor':
+        """
+        Обучает трансформеры на train данных.
+        
+        - Бинарные индексы: вычисляются на ВСЕХ данных (train+val+test)
+        - QuantileTransformer/StandardScaler: обучается на train
+        - OrdinalEncoder: обучается на train
+        - OneHotEncoder: обучается на train
+        
+        Args:
+            dataset: Датасет с train/val/test частями
+            
+        Returns:
+            self для chaining
+        """
+        # 1. Извлечение бинарных признаков (индексы на всех данных)
+        if 'x_num' in dataset.data and self.config.get('extract_bin_from_num'):
+            x_num_all = np.concatenate(list(dataset.data['x_num'].values()))
+            has_missing = np.any(np.isnan(x_num_all), 0)
+            unique_counts = np.array([len(np.unique(col)) for col in x_num_all.T])
+            bin_mask = (unique_counts == 2) & ~has_missing
+            self.feature_indices_bin = np.nonzero(bin_mask)[0]
+            self.feature_indices_num = np.nonzero(~bin_mask)[0]
+        
+        # 2. Обучение QuantileTransformer/StandardScaler (на train)
+        if 'x_num' in dataset.data and self.config.get('num_policy'):
+            num_policy = NumPolicy(self.config['num_policy'])
+            X_num_train = dataset.data['x_num']['train']
+            
+            if num_policy == NumPolicy.STANDARD:
+                self.transformer_num = sklearn.preprocessing.StandardScaler()
+            elif num_policy == NumPolicy.NOISY_QUANTILE:
+                self.transformer_num = sklearn.preprocessing.QuantileTransformer(
+                    n_quantiles=max(min(X_num_train.shape[0] // 30, 1000), 10),
+                    output_distribution='normal',
+                    subsample=1_000_000_000,
+                    random_state=self.seed,
+                )
+                # Добавляем шум для noisy-quantile
+                X_num_train = X_num_train + np.random.RandomState(self.seed).normal(
+                    0.0, 1e-5, X_num_train.shape
+                ).astype(X_num_train.dtype)
+            
+            self.transformer_num.fit(X_num_train)
+        
+        # 3. Обучение OrdinalEncoder (на train)
+        if 'x_cat' in dataset.data and self.config.get('cat_policy'):
+            unknown_value = np.iinfo('int64').max - 3
+            self.transformer_cat_ordinal = sklearn.preprocessing.OrdinalEncoder(
+                handle_unknown='use_encoded_value',
+                unknown_value=unknown_value,
+                dtype='int64',
+            ).fit(dataset.data['x_cat']['train'])
+            
+            # 4. Обучение OneHotEncoder (на train, если нужно)
+            cat_policy = CatPolicy(self.config['cat_policy'])
+            if cat_policy == CatPolicy.ONE_HOT:
+                # Сначала кодируем train для OneHotEncoder
+                X_cat_train_encoded = self.transformer_cat_ordinal.transform(
+                    dataset.data['x_cat']['train']
+                )
+                self.transformer_cat_onehot = sklearn.preprocessing.OneHotEncoder(
+                    handle_unknown='ignore',
+                    sparse_output=False,
+                    dtype=np.float32,
+                ).fit(X_cat_train_encoded)
+        
+        self._fitted = True
+        return self
+    
+    def transform(self, dataset: 'Dataset[np.ndarray]') -> 'Dataset[np.ndarray]':
+        """
+        Применяет обученные трансформеры ко всем частям.
+        
+        - Извлекает бинарные признаки по сохранённым индексам
+        - Применяет QuantileTransformer/StandardScaler ко всем частям
+        - Применяет OrdinalEncoder ко всем частям
+        - Применяет OneHotEncoder ко всем частям (если нужно)
+        
+        Args:
+            dataset: Датасет с train/val/test частями
+            
+        Returns:
+            Новый датасет с трансформированными данными
+        """
+        assert self._fitted, "Must call fit() before transform()"
+        
+        # Создаём копию данных
+        data = {k: dict(v) for k, v in dataset.data.items()}
+        
+        # 1. Извлечение бинарных признаков
+        if self.feature_indices_bin is not None and 'x_num' in data:
+            x_bin = {}
+            x_num_remaining = {}
+            for k, v in data['x_num'].items():
+                x_bin[k] = v[:, self.feature_indices_bin].astype(_X_CAT_INT_DTYPE)
+                x_num_remaining[k] = v[:, self.feature_indices_num]
+            
+            # Объединяем с существующими x_bin
+            if 'x_bin' in data:
+                for k in x_bin:
+                    x_bin[k] = np.concatenate([x_bin[k], data['x_bin'][k]], axis=-1)
+            
+            data['x_bin'] = x_bin
+            data['x_num'] = x_num_remaining
+        
+        # 2. Применение QuantileTransformer/StandardScaler
+        if self.transformer_num is not None and 'x_num' in data:
+            x_num_transformed = {}
+            for k, v in data['x_num'].items():
+                # Для noisy-quantile добавляем шум только к train
+                if k == 'train' and isinstance(self.transformer_num, sklearn.preprocessing.QuantileTransformer):
+                    v = v + np.random.RandomState(self.seed).normal(
+                        0.0, 1e-5, v.shape
+                    ).astype(v.dtype)
+                
+                x_num_transformed[k] = self.transformer_num.transform(v)
+                # Заменяем NaN на 0
+                x_num_transformed[k] = np.nan_to_num(x_num_transformed[k], copy=False)
+            
+            # Удаляем константные столбцы
+            mask = np.ptp(x_num_transformed['train'], axis=0) != 0
+            for k in x_num_transformed:
+                x_num_transformed[k] = x_num_transformed[k][:, mask].astype(_X_NUM_DTYPE)
+            
+            data['x_num'] = x_num_transformed
+        
+        # 3. Применение bin_policy (convert-to-cat)
+        if 'x_bin' in data and self.config.get('bin_policy') == 'convert-to-cat':
+            x_bin = data.pop('x_bin')
+            if 'x_cat' not in data:
+                data['x_cat'] = {k: np.where(np.isnan(v), 2.0, v).astype(_X_CAT_INT_DTYPE)
+                                for k, v in x_bin.items()}
+            else:
+                for k in x_bin:
+                    x_bin_as_cat = x_bin[k].astype(data['x_cat'][k].dtype)
+                    data['x_cat'][k] = np.column_stack([data['x_cat'][k], x_bin_as_cat])
+        
+        # 4. Применение OrdinalEncoder
+        if self.transformer_cat_ordinal is not None and 'x_cat' in data:
+            x_cat_encoded = {}
+            for k, v in data['x_cat'].items():
+                x_cat_encoded[k] = self.transformer_cat_ordinal.transform(v)
+            
+            # Обрабатываем неизвестные категории в val/test
+            max_values = x_cat_encoded['train'].max(axis=0)
+            unknown_value = np.iinfo('int64').max - 3
+            for part in ['val', 'test']:
+                if part in x_cat_encoded:
+                    for column_idx in range(x_cat_encoded[part].shape[1]):
+                        x_cat_encoded[part][x_cat_encoded[part][:, column_idx] == unknown_value, column_idx] = (
+                            max_values[column_idx] + 1
+                        )
+            
+            # 5. Применение OneHotEncoder (если нужно)
+            if self.transformer_cat_onehot is not None:
+                x_cat_onehot = {}
+                for k, v in x_cat_encoded.items():
+                    x_cat_onehot[k] = self.transformer_cat_onehot.transform(v)
+                data['x_cat'] = x_cat_onehot
+            else:
+                data['x_cat'] = x_cat_encoded
+        
+        return dataclasses.replace(dataset, data=data)
+    
+    def fit_transform(self, dataset: 'Dataset[np.ndarray]') -> 'Dataset[np.ndarray]':
+        """
+        Обучает и применяет трансформеры.
+        
+        Args:
+            dataset: Датасет с train/val/test частями
+            
+        Returns:
+            Новый датасет с трансформированными данными
+        """
+        return self.fit(dataset).transform(dataset)
+
 # NOTE
 # Split is a flat dictionary of indices, e.g. `{"train": ..., "val": ..., "test": ...}`
 type Split = dict[PartKey, np.ndarray]

@@ -1323,7 +1323,18 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
 
     # >>> Data
     print('Loading dataset...')
-    dataset = lib.data.build_dataset(**config['data'])
+    # Создаём DataPreprocessor с seed из конфига
+    data_config_with_seed = {**config['data'], 'seed': config['seed']}
+    preprocessor = lib.data.DataPreprocessor(data_config_with_seed)
+    
+    # Загружаем сырые данные
+    dataset = lib.data.Dataset.from_dir(
+        Path(config['data']['path']).resolve(),
+        config['data'].get('split_id', lib.data.DEFAULT_SPLIT_ID)
+    )
+    
+    # Обучаем и применяем препроцессор
+    dataset = preprocessor.fit_transform(dataset)
     assert dataset.n_bin_features == 0
     print(f'Dataset loaded: {dataset.size("train")} train, {dataset.size("val")} val, {dataset.size("test")} test')
     regression_label_stats = dataset.try_standardize_labels_()
@@ -2009,11 +2020,6 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             
             state_dicts_to_save = saved_model_state_dicts
         model_config_to_save = resolved_model_config
-        feature_indices_to_save = {
-            'num': lib.data.FEATURE_INDICES_NUM,
-            'cat': lib.data.FEATURE_INDICES_CAT,
-            'bin': lib.data.FEATURE_INDICES_BIN,
-        }
         cat_cardinalities_to_save = cat_cardinalities
         n_classes_to_save = n_classes
         prediction_type_to_save = prediction_type.value
@@ -2023,11 +2029,6 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             else dataclasses.asdict(regression_label_stats)
         )
         data_config_to_save = {**config['data'], 'seed': config['seed']}
-        transformers_to_save = {
-            'num': lib.data.TRANSFORMER_NUM,
-            'cat_ordinal': lib.data.TRANSFORMER_CAT_ORDINAL,
-            'cat_onehot': lib.data.TRANSFORMER_CAT_ONEHOT,
-        }
         
         torch.save(
             {
@@ -2041,9 +2042,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 'prediction_type': prediction_type_to_save,
                 'regression_label_stats': regression_label_stats_to_save,
                 'data_config': data_config_to_save,
-                'feature_indices': feature_indices_to_save,
                 'ensemble': ensemble_info,
-                'transformers': transformers_to_save,
+                'preprocessor': preprocessor,
             },
             exp / 'model.pt',
         )
