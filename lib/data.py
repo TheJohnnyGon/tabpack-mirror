@@ -44,6 +44,12 @@ FEATURE_INDICES_NUM: np.ndarray | None = None
 FEATURE_INDICES_CAT: np.ndarray | None = None
 FEATURE_INDICES_BIN: np.ndarray | None = None
 
+# Global variables to store fitted transformers after preprocessing
+# These are populated by transform_num() and transform_cat() and can be saved to model.pt
+TRANSFORMER_NUM: sklearn.preprocessing.StandardScaler | sklearn.preprocessing.QuantileTransformer | None = None
+TRANSFORMER_CAT_ORDINAL: sklearn.preprocessing.OrdinalEncoder | None = None
+TRANSFORMER_CAT_ONEHOT: sklearn.preprocessing.OneHotEncoder | None = None
+
 # NOTE
 # Split is a flat dictionary of indices, e.g. `{"train": ..., "val": ..., "test": ...}`
 type Split = dict[PartKey, np.ndarray]
@@ -238,6 +244,8 @@ def transform_num(
             X_num_transformed[k] = normalizer.transform(v)
             del v
         X_num = X_num_transformed
+        global TRANSFORMER_NUM
+        TRANSFORMER_NUM = normalizer
         del normalizer
         gc.collect()
 
@@ -437,6 +445,8 @@ def transform_cat(
     for k, v in X_cat.items():
         X_cat_encoded[k] = encoder.transform(v)
         del v
+    global TRANSFORMER_CAT_ORDINAL
+    TRANSFORMER_CAT_ORDINAL = encoder
     del X_cat, encoder
 
     max_values = X_cat_encoded['train'].max(axis=0)
@@ -461,6 +471,8 @@ def transform_cat(
         for k, v in X_cat_encoded.items():
             X_cat_onehot[k] = cast(np.ndarray, encoder.transform(v))
             del v
+        global TRANSFORMER_CAT_ONEHOT
+        TRANSFORMER_CAT_ONEHOT = encoder
         del X_cat_encoded, encoder
         gc.collect()
         return X_cat_onehot

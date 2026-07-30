@@ -35,11 +35,17 @@ def load_model_artifact(path: str | Path) -> dict:
 def build_dataset_with_indices(
     data_config: dict,
     feature_indices: dict,
+    transformers: dict,
 ) -> lib.data.Dataset:
-    """Build dataset using stored feature indices for consistent preprocessing.
+    """Build dataset using stored feature indices and transformers for consistent preprocessing.
     
     This function replicates the preprocessing done during training,
-    using the stored feature indices to ensure the same features are selected.
+    using the stored feature indices and transformers to ensure exact reproducibility.
+    
+    Assumptions (based on training logic):
+    - Binary features are always 0/1 (no NaN, no other values)
+    - feature_indices always contains 'num', 'cat', 'bin' keys
+    - transformers always contains fitted objects
     """
     path = Path(data_config['path']).resolve()
     split_id = data_config.get('split_id', ('default',))
@@ -50,28 +56,20 @@ def build_dataset_with_indices(
     print(f'Loading dataset from {path.name}...')
     dataset = lib.data.Dataset.from_dir(path, split_id)
     
-    # Get feature indices
-    num_indices = feature_indices.get('num')
-    bin_indices = feature_indices.get('bin')
-    cat_indices = feature_indices.get('cat')
+    # Get feature indices (always present)
+    num_indices = feature_indices['num']
+    bin_indices = feature_indices['bin']
+    cat_indices = feature_indices['cat']
     
     # Extract binary features from numerical using stored indices
     if 'x_num' in dataset.data and bin_indices is not None:
         print(f'Extracting {len(bin_indices)} binary features using stored indices...')
         x_num = dataset.data['x_num']
         
-        # Create binary features from stored indices
-        # Binary features are determined on train+val+test, so test may have non-0/1 values
-        # We need to handle this by replacing invalid values with 2 (like NaN handling)
+        # Binary features are always 0/1, no NaN handling needed
         x_bin = {}
         for k, v in x_num.items():
-            bin_data = v[:, bin_indices]
-            # Replace NaN and non-0/1 values with 2
-            bin_data = np.where(
-                np.isnan(bin_data) | (bin_data != 0) & (bin_data != 1),
-                2.0,
-                bin_data
-            ).astype(lib.data._X_CAT_INT_DTYPE)
+            bin_data = v[:, bin_indices].astype(lib.data._X_CAT_INT_DTYPE)
             x_bin[k] = bin_data
         
         # Keep remaining numerical features
@@ -93,14 +91,26 @@ def build_dataset_with_indices(
                 for k in x_bin.keys()
             }
     
-    # Apply numerical transformation
+    # Apply numerical transformation using saved transformer
     num_policy = data_config.get('num_policy')
     if 'x_num' in dataset.data and num_policy is not None:
         print(f'Transforming numerical features (policy={num_policy})...')
-        seed = data_config.get('seed', 0)
-        dataset.data['x_num'] = lib.data.transform_num(
-            dataset.data['x_num'], num_policy, seed
-        )
+        normalizer = transformers['num']
+        assert normalizer is not None, 'num_policy is set but transformer is None'
+        
+        # Transform one part at a time to reduce peak memory
+        X_num_transformed = {}
+        for k, v in dataset.data['x_num'].items():
+            X_num_transformed[k] = normalizer.transform(v)
+        dataset.data['x_num'] = X_num_transformed
+        
+        # Replace NaN with zeros (same as training)
+        dataset.data['x_num'] = {k: np.nan_to_num(v) for k, v in dataset.data['x_num'].items()}
+        
+        # Remove constant columns (same mask as training)
+        mask = np.ptp(dataset.data['x_num']['train'], axis=0) != 0
+        dataset.data['x_num'] = {k: v[:, mask] for k, v in dataset.data['x_num'].items()}
+        dataset.data['x_num'] = {k: v.astype(lib.data._X_NUM_DTYPE) for k, v in dataset.data['x_num'].items()}
     
     # Apply binary policy (convert to categorical)
     bin_policy = data_config.get('bin_policy')
@@ -108,11 +118,39 @@ def build_dataset_with_indices(
         print('Converting binary features to categorical...')
         dataset.convert_bin_features_to_cat_()
     
-    # Apply categorical transformation
+    # Apply categorical transformation using saved transformers
     cat_policy = data_config.get('cat_policy')
     if 'x_cat' in dataset.data and cat_policy is not None:
         print(f'Transforming categorical features (policy={cat_policy})...')
-        dataset.data['x_cat'] = lib.data.transform_cat(dataset.data['x_cat'], cat_policy)
+        
+        # Use saved ordinal encoder
+        encoder = transformers['cat_ordinal']
+        assert encoder is not None, 'cat_policy is set but cat_ordinal transformer is None'
+        
+        X_cat_encoded = {}
+        for k, v in dataset.data['x_cat'].items():
+            X_cat_encoded[k] = encoder.transform(v)
+        
+        # Handle unknown categories (same as training)
+        unknown_value = np.iinfo('int64').max - 3
+        max_values = X_cat_encoded['train'].max(axis=0)
+        for part in ['val', 'test']:
+            for column_idx in range(X_cat_encoded[part].shape[1]):
+                X_cat_encoded[part][X_cat_encoded[part][:, column_idx] == unknown_value, column_idx] = (
+                    max_values[column_idx] + 1
+                )
+        
+        if cat_policy == 'ordinal':
+            dataset.data['x_cat'] = X_cat_encoded
+        elif cat_policy == 'one-hot':
+            # Use saved one-hot encoder
+            onehot_encoder = transformers['cat_onehot']
+            assert onehot_encoder is not None, 'cat_policy is one-hot but cat_onehot transformer is None'
+            
+            X_cat_onehot = {}
+            for k, v in X_cat_encoded.items():
+                X_cat_onehot[k] = onehot_encoder.transform(v)
+            dataset.data['x_cat'] = X_cat_onehot
     
     return dataset
 
@@ -303,17 +341,14 @@ def main():
     print(f'  n_classes: {artifact["n_classes"]}')
     print(f'  prediction_type: {artifact["prediction_type"]}')
     
-    # Check for feature indices
-    feature_indices = artifact.get('feature_indices', {})
-    if feature_indices:
-        print(f'  feature_indices:')
-        for key, indices in feature_indices.items():
-            if indices is not None:
-                print(f'    {key}: {len(indices)} features')
-            else:
-                print(f'    {key}: None')
-    else:
-        print('  WARNING: No feature_indices in model.pt, using build_dataset directly')
+    # Check for feature indices (always present)
+    feature_indices = artifact['feature_indices']
+    print(f'  feature_indices:')
+    for key, indices in feature_indices.items():
+        if indices is not None:
+            print(f'    {key}: {len(indices)} features')
+        else:
+            print(f'    {key}: None')
 
     # Check for ensemble info
     ensemble_info = artifact.get('ensemble')
@@ -345,13 +380,10 @@ def main():
         print('  ensemble: None (using all saved models with simple averaging)')
         ensemble_weights = None
 
-    # Build dataset
+    # Build dataset using saved transformers
     print(f'\nBuilding dataset...')
-    if feature_indices and any(v is not None for v in feature_indices.values()):
-        dataset = build_dataset_with_indices(artifact['data_config'], feature_indices)
-    else:
-        # Fallback to original build_dataset
-        dataset = lib.data.build_dataset(**artifact['data_config'])
+    transformers = artifact.get('transformers', {})
+    dataset = build_dataset_with_indices(artifact['data_config'], feature_indices, transformers)
     
     print(f'  train: {dataset.size("train")}, val: {dataset.size("val")}, test: {dataset.size("test")}')
     print(f'  n_num_features: {dataset.n_num_features}')

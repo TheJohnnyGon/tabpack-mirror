@@ -1500,6 +1500,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         prediction_type: str
         regression_label_stats: None | dict[str, float]
         data_config: KWArgs
+        transformers: dict[str, Any]
 
     last_ensemble_snapshot: None | EnsembleSnapshot = None
     logger.debug('Prepared ensemble snapshot storage')
@@ -1835,6 +1836,11 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                         else dataclasses.asdict(regression_label_stats)
                     ),
                     data_config=config['data'],
+                    transformers={
+                        'num': lib.data.TRANSFORMER_NUM,
+                        'cat_ordinal': lib.data.TRANSFORMER_CAT_ORDINAL,
+                        'cat_onehot': lib.data.TRANSFORMER_CAT_ONEHOT,
+                    },
                 )
                 logger.debug(f'Saved ensemble snapshot with {len(ensemble_ids)} models')
 
@@ -1977,6 +1983,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             prediction_type_to_save = last_ensemble_snapshot['prediction_type']
             regression_label_stats_to_save = last_ensemble_snapshot['regression_label_stats']
             data_config_to_save = last_ensemble_snapshot['data_config']
+            transformers_to_save = last_ensemble_snapshot['transformers']
             logger.info(f'Using ensemble snapshot with {len(ensemble_info["ids"])} models')
         else:
             # Fallback: no ensemble snapshot, use original logic
@@ -2025,6 +2032,11 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 else dataclasses.asdict(regression_label_stats)
             )
             data_config_to_save = config['data']
+            transformers_to_save = {
+                'num': lib.data.TRANSFORMER_NUM,
+                'cat_ordinal': lib.data.TRANSFORMER_CAT_ORDINAL,
+                'cat_onehot': lib.data.TRANSFORMER_CAT_ONEHOT,
+            }
         
         torch.save(
             {
@@ -2040,6 +2052,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 'data_config': data_config_to_save,
                 'feature_indices': feature_indices_to_save,
                 'ensemble': ensemble_info,
+                'transformers': transformers_to_save,
             },
             exp / 'model.pt',
         )
