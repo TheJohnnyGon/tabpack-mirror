@@ -1898,6 +1898,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         ensemble_info = None
         if online_ensembles is not None and 'greedy' in online_ensembles:
             greedy_ens = online_ensembles['greedy']
+            update_type = greedy_ens._update_type
             ensemble_info = {
                 'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
                 'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
@@ -1908,25 +1909,36 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             if ensemble_info['ids'] is not None:
                 ensemble_state_dicts = {}
                 ensemble_steps = {}
+                current_model_state_dict = model.state_dict()
                 
-                for greedy_id in ensemble_info['ids']:
+                for idx, greedy_id in enumerate(ensemble_info['ids']):
                     if greedy_id in saved_model_state_dicts:
+                        # Finished model - use saved weights
                         ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
                         # Get step from final_state
                         final_idx = np.where(final_state.ids == greedy_id)[0]
                         if len(final_idx) > 0:
                             ensemble_steps[greedy_id] = int(final_state.steps[final_idx[0]])
                     else:
+                        # Running model
                         state_idx = np.where(state.ids == greedy_id)[0]
                         if len(state_idx) > 0:
                             i = int(state_idx[0])
-                            # Use BEST weights for running models
+                            # Choose weights based on update_type
+                            if update_type == 'latest':
+                                # Use CURRENT weights for 'latest' update type
+                                state_dict_to_use = current_model_state_dict
+                                step_to_use = int(state.steps[i])
+                            else:
+                                # Use BEST weights for 'best' or 'final' update types
+                                state_dict_to_use = state.best_model_state_dicts
+                                step_to_use = int(state.best_steps[i])
+                            
                             ensemble_state_dicts[greedy_id] = {
                                 name: value[i : i + 1].detach().cpu().clone()
-                                for name, value in state.best_model_state_dicts.items()
+                                for name, value in state_dict_to_use.items()
                             }
-                            # Get best step from state
-                            ensemble_steps[greedy_id] = int(state.best_steps[i])
+                            ensemble_steps[greedy_id] = step_to_use
                 
                 ensemble_info['steps'] = ensemble_steps
                 saved_model_state_dicts.clear()
