@@ -117,10 +117,13 @@ class DataPreprocessor:
             has_missing = np.any(np.isnan(x_num_all), 0)
             unique_values = [np.unique(x) for x in x_num_all.T]
             unique_counts = np.array([len(x) for x in unique_values])
+            del x_num_all  # Освобождаем конкатенированный массив сразу
+            
             bin_mask = (unique_counts == 2) & ~has_missing
             self.feature_indices_bin = np.nonzero(bin_mask)[0]
             self.feature_indices_num = np.nonzero(~bin_mask)[0]
             self._bin_mask = bin_mask
+            del unique_counts, has_missing  # Освобождаем промежуточные массивы
             
             # Проверяем, все ли бинарные столбцы содержат только 0/1
             skip_encoder = self.config.get('skip_bin_encoder', False)
@@ -135,6 +138,7 @@ class DataPreprocessor:
                     categories=self._unique_values_bin
                 )
                 self.transformer_bin_ordinal.fit(dataset.data['x_num']['train'][:, self.feature_indices_bin])
+            del unique_values  # Освобождаем после использования
         
         # 2. Обучение QuantileTransformer/StandardScaler (на train, ПОСЛЕ извлечения бинарных)
         if 'x_num' in dataset.data and self.config.get('num_policy'):
@@ -148,6 +152,7 @@ class DataPreprocessor:
             if num_policy == NumPolicy.STANDARD:
                 self.transformer_num = sklearn.preprocessing.StandardScaler()
                 self.transformer_num.fit(X_num_train)
+                del X_num_train
             elif num_policy == NumPolicy.NOISY_QUANTILE:
                 # Для noisy-quantile используем columnwise трансформацию если memory_efficient
                 if self.config.get('num_memory_efficient', False):
@@ -168,6 +173,8 @@ class DataPreprocessor:
                         )
                         normalizer.fit(fit_data.reshape(-1, 1))
                         self._num_transformer_params.append(normalizer)
+                        del fit_data, noise
+                    del X_num_train
                 else:
                     self.transformer_num = sklearn.preprocessing.QuantileTransformer(
                         n_quantiles=max(min(X_num_train.shape[0] // 30, 1000), 10),
@@ -180,12 +187,15 @@ class DataPreprocessor:
                         0.0, 1e-5, X_num_train.shape
                     ).astype(X_num_train.dtype)
                     self.transformer_num.fit(X_num_train_noisy)
+                    del X_num_train_noisy  # Освобождаем зашумлённые данные
                     
                     # Вычисляем маску константных столбцов ПОСЛЕ трансформации ОРИГИНАЛЬНЫХ данных
                     # (как в оригинальном transform_num)
                     X_num_train_transformed = self.transformer_num.transform(X_num_train)
+                    del X_num_train  # Освобождаем оригинальные данные
                     X_num_train_transformed = np.nan_to_num(X_num_train_transformed, copy=False)
                     self._constant_mask = np.ptp(X_num_train_transformed, axis=0) == 0
+                    del X_num_train_transformed  # Освобождаем трансформированные данные
         
         # 3. Обучение OrdinalEncoder для категориальных (на train)
         if 'x_cat' in dataset.data and self.config.get('cat_policy'):
@@ -247,7 +257,7 @@ class DataPreprocessor:
             else:
                 # Прямой каст (skip_bin_encoder=True и все столбцы 0/1)
                 for k, v in data['x_num'].items():
-                    x_bin[k] = v[:, self.feature_indices_bin].astype(_X_CAT_INT_DTYPE)
+                    x_bin[k] = v[:, self.feature_indices_bin].astype(_X_CAT_INT_DTYPE, copy=False)
                     x_num_remaining[k] = v[:, self.feature_indices_num]
             
             # Объединяем с существующими x_bin
@@ -255,8 +265,12 @@ class DataPreprocessor:
                 for k in x_bin:
                     x_bin[k] = np.concatenate([x_bin[k], data['x_bin'][k]], axis=-1)
             
+            # Освобождаем старые данные перед заменой
+            old_x_num = data.pop('x_num')
             data['x_bin'] = x_bin
             data['x_num'] = x_num_remaining
+            del old_x_num
+            gc.collect()
         
         # 2. Применение QuantileTransformer/StandardScaler
         if self.transformer_num is not None and 'x_num' in data:
@@ -276,7 +290,11 @@ class DataPreprocessor:
                 for k in x_num_transformed:
                     x_num_transformed[k] = x_num_transformed[k].astype(_X_NUM_DTYPE)
             
+            # Освобождаем старые данные перед заменой
+            old_x_num = data.pop('x_num')
             data['x_num'] = x_num_transformed
+            del old_x_num
+            gc.collect()
         elif hasattr(self, '_num_transformer_params') and 'x_num' in data:
             # Columnwise трансформация для memory_efficient
             x_num_transformed = {}
