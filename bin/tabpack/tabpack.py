@@ -2022,7 +2022,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             if regression_label_stats is None
             else dataclasses.asdict(regression_label_stats)
         )
-        data_config_to_save = config['data']
+        data_config_to_save = {**config['data'], 'seed': config['seed']}
         transformers_to_save = {
             'num': lib.data.TRANSFORMER_NUM,
             'cat_ordinal': lib.data.TRANSFORMER_CAT_ORDINAL,
