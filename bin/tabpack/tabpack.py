@@ -31,6 +31,7 @@ import bin.tune
 import lib.util
 import bin.tabpack.ensemble_utils
 import bin.tabpack.ensemble_utils_torch
+import bin.tabpack.ensemble_checkpoint
 import bin.tabpack.metrics
 import bin.tabpack.nn
 import bin.tabpack.optim
@@ -1491,7 +1492,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # member is collected here (keyed by its id) right before the member is
     # removed from the pack, and dumped to `model.pt` after training.
     save_model = config.get('save_model', False)
-    saved_model_state_dicts: dict[int, dict[str, Tensor]] = {}
+    checkpoint_store = bin.tabpack.ensemble_checkpoint.EnsembleCheckpointStore()
     online_ensemble_predictions: None | dict[str, dict[PartKey, np.ndarray]] = (
         None
         if online_ensembles is None
@@ -1725,11 +1726,16 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             if save_model:
                 for i in map(int, stop_pack_idx):
                     member_id = int(state.ids[i])
-                    saved_model_state_dicts[member_id] = {
-                        name: value[i : i + 1].detach().cpu().clone()
-                        for name, value in state.best_model_state_dicts.items()
-                    }
-                    del member_id
+                    member_step = int(state.best_steps[i])
+                    checkpoint_store.save_checkpoint(
+                        model_id=member_id,
+                        step=member_step,
+                        state_dict={
+                            name: value[i : i + 1]
+                            for name, value in state.best_model_state_dicts.items()
+                        },
+                    )
+                    del member_id, member_step
                 del i
 
             # Remove the stopped models.
@@ -1801,40 +1807,55 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 ensemble_steps_list = first_ensemble.steps.tolist()
                 update_type = first_ensemble._update_type
 
-                snapshot_state_dicts: dict[int, dict[str, Tensor]] = {}
-                snapshot_steps: dict[int, int] = {}
                 current_model_state_dict = model.state_dict()
 
-                for idx, eid in enumerate(ensemble_ids):
-                    snapshot_steps[eid] = int(ensemble_steps_list[idx])
+                # Track which (id, step) pairs are in the current ensemble
+                current_ensemble_keys: set[tuple[int, int]] = set()
 
-                    if eid in saved_model_state_dicts:
-                        # Finished model - use saved weights
-                        snapshot_state_dicts[eid] = saved_model_state_dicts[eid]
-                    else:
-                        # Running model
-                        state_idx = np.where(state.ids == eid)[0]
-                        if len(state_idx) > 0:
-                            i = int(state_idx[0])
-                            if update_type == 'latest':
-                                # Use CURRENT weights for 'latest' update type
-                                state_dict_to_use = current_model_state_dict
-                            else:
-                                # Use BEST weights for 'best' or 'final' update types
-                                state_dict_to_use = state.best_model_state_dicts
-                            
-                            snapshot_state_dicts[eid] = {
-                                name: value[i : i + 1].detach().cpu().clone()
+                for idx, eid in enumerate(ensemble_ids):
+                    estep = int(ensemble_steps_list[idx])
+                    current_ensemble_keys.add((eid, estep))
+
+                    if checkpoint_store.has_checkpoint(eid, estep):
+                        # Already saved (finished model or previously captured)
+                        continue
+
+                    # Running model - save checkpoint for this (id, step) pair
+                    state_idx = np.where(state.ids == eid)[0]
+                    if len(state_idx) > 0:
+                        i = int(state_idx[0])
+                        if update_type == 'latest':
+                            # Use CURRENT weights for 'latest' update type
+                            state_dict_to_use = current_model_state_dict
+                        else:
+                            # Use BEST weights for 'best' or 'final' update types
+                            state_dict_to_use = state.best_model_state_dicts
+                        
+                        checkpoint_store.save_checkpoint(
+                            model_id=eid,
+                            step=estep,
+                            state_dict={
+                                name: value[i : i + 1]
                                 for name, value in state_dict_to_use.items()
-                            }
+                            },
+                        )
+
+                # Remove old ensemble checkpoints that are no longer in the current ensemble
+                # This prevents memory growth from accumulating checkpoints across iterations
+                keys_to_remove = [
+                    key for key in checkpoint_store.get_all_checkpoints().keys()
+                    if key not in current_ensemble_keys
+                ]
+                
+                for key in keys_to_remove:
+                    checkpoint_store.remove_checkpoint(*key)
 
                 last_ensemble_snapshot = {
                     'ids': ensemble_ids,
                     'weights': ensemble_weights,
-                    'steps': snapshot_steps,
-                    'state_dicts': snapshot_state_dicts,
+                    'steps': ensemble_steps_list,
                 }
-                logger.debug(f'Saved ensemble snapshot with {len(ensemble_ids)} models')
+                logger.debug(f'Saved ensemble snapshot with {len(ensemble_ids)} models (removed {len(keys_to_remove)} old checkpoints)')
 
         del latest_predictions, latest_predictions_torch
         _free_mps_memory()
@@ -1968,7 +1989,15 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 'weights': last_ensemble_snapshot['weights'],
                 'steps': last_ensemble_snapshot['steps'],
             }
-            state_dicts_to_save = last_ensemble_snapshot['state_dicts']
+            # Build state_dicts from checkpoint_store using (id, step) pairs
+            state_dicts_to_save = {}
+            for idx, eid in enumerate(ensemble_info['ids']):
+                estep = ensemble_info['steps'][idx]
+                key = (eid, estep)
+                if checkpoint_store.has_checkpoint(eid, estep):
+                    state_dicts_to_save[key] = checkpoint_store.get_checkpoint(eid, estep)
+                else:
+                    logger.warning(f'Checkpoint not found for model {eid} at step {estep}')
             logger.info(f'Using ensemble snapshot with {len(ensemble_info["ids"])} models')
         else:
             # Fallback: no ensemble snapshot
@@ -1979,49 +2008,60 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 ensemble_info = {
                     'ids': greedy_ens.ids.tolist() if len(greedy_ens.ids) > 0 else None,
                     'weights': greedy_ens.weights.tolist() if greedy_ens.weights is not None else None,
-                    'steps': {},
+                    'steps': [],
                 }
                 
                 # If greedy ensemble exists, save ONLY its models
                 if ensemble_info['ids'] is not None:
-                    ensemble_state_dicts = {}
-                    ensemble_steps = {}
+                    ensemble_steps_list = []
                     current_model_state_dict = model.state_dict()
                     
                     for idx, greedy_id in enumerate(ensemble_info['ids']):
-                        if greedy_id in saved_model_state_dicts:
-                            # Finished model - use saved weights
-                            ensemble_state_dicts[greedy_id] = saved_model_state_dicts[greedy_id]
-                            # Get step from final_state
-                            final_idx = np.where(final_state.ids == greedy_id)[0]
-                            if len(final_idx) > 0:
-                                ensemble_steps[greedy_id] = int(final_state.steps[final_idx[0]])
+                        # Determine the step for this ensemble member
+                        final_idx = np.where(final_state.ids == greedy_id)[0]
+                        if len(final_idx) > 0:
+                            step_to_use = int(final_state.steps[final_idx[0]])
                         else:
-                            # Running model
                             state_idx = np.where(state.ids == greedy_id)[0]
                             if len(state_idx) > 0:
                                 i = int(state_idx[0])
-                                # Choose weights based on update_type
                                 if update_type == 'latest':
-                                    # Use CURRENT weights for 'latest' update type
-                                    state_dict_to_use = current_model_state_dict
                                     step_to_use = int(state.steps[i])
                                 else:
-                                    # Use BEST weights for 'best' or 'final' update types
-                                    state_dict_to_use = state.best_model_state_dicts
                                     step_to_use = int(state.best_steps[i])
+                            else:
+                                continue
+                        
+                        ensemble_steps_list.append(step_to_use)
+                        
+                        if not checkpoint_store.has_checkpoint(greedy_id, step_to_use):
+                            # Running model - save checkpoint
+                            state_idx = np.where(state.ids == greedy_id)[0]
+                            if len(state_idx) > 0:
+                                i = int(state_idx[0])
+                                if update_type == 'latest':
+                                    state_dict_to_use = current_model_state_dict
+                                else:
+                                    state_dict_to_use = state.best_model_state_dicts
                                 
-                                ensemble_state_dicts[greedy_id] = {
-                                    name: value[i : i + 1].detach().cpu().clone()
-                                    for name, value in state_dict_to_use.items()
-                                }
-                                ensemble_steps[greedy_id] = step_to_use
+                                checkpoint_store.save_checkpoint(
+                                    model_id=greedy_id,
+                                    step=step_to_use,
+                                    state_dict={
+                                        name: value[i : i + 1]
+                                        for name, value in state_dict_to_use.items()
+                                    },
+                                )
                     
-                    ensemble_info['steps'] = ensemble_steps
-                    saved_model_state_dicts.clear()
-                    saved_model_state_dicts.update(ensemble_state_dicts)
+                    ensemble_info['steps'] = ensemble_steps_list
             
-            state_dicts_to_save = saved_model_state_dicts
+            # Build state_dicts from checkpoint_store
+            state_dicts_to_save = {}
+            if ensemble_info is not None and ensemble_info['ids'] is not None:
+                for idx, eid in enumerate(ensemble_info['ids']):
+                    estep = ensemble_info['steps'][idx]
+                    if checkpoint_store.has_checkpoint(eid, estep):
+                        state_dicts_to_save[(eid, estep)] = checkpoint_store.get_checkpoint(eid, estep)
         model_config_to_save = resolved_model_config
         cat_cardinalities_to_save = cat_cardinalities
         n_classes_to_save = n_classes
