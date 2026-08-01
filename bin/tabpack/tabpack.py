@@ -866,6 +866,27 @@ def generate_training_batches(
     return batches
 
 
+def generate_pair_training_batches(
+    *,
+    n_pairs: int,
+    batch_size: int,
+    batch_generator: torch.Generator,
+    pack_size: int,
+) -> list[Tensor]:
+    """Generate training batches of pair indices for one epoch.
+    
+    Returns list of tensors with shape (pack_size, batch_size) — indices into pair arrays.
+    Same per-model shuffling pattern as generate_training_batches().
+    """
+    random_values = torch.rand(
+        (pack_size, n_pairs),
+        generator=batch_generator,
+        device=batch_generator.device,
+    )
+    batches = random_values.argsort(dim=BATCH_DIM).split(batch_size, dim=BATCH_DIM)
+    return list(batches)
+
+
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 # Evaluation
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
@@ -887,6 +908,8 @@ def _evaluate(
     prediction_type: str | PredictionType,
     batch_size: int,
     device: torch.device,
+    use_pair_logit: bool = False,
+    eval_pairs_t: None | dict[PartKey, tuple[Tensor, Tensor]] = None,
 ) -> _EvaluateOutput:
     model.eval()
     del optimizer
@@ -906,28 +929,43 @@ def _evaluate(
             dim=BATCH_DIM,
         )
 
-        if dataset.task.is_regression:
-            assert regression_label_stats is not None
-            y_pred_torch *= regression_label_stats.std
-            y_pred_torch += regression_label_stats.mean
-
-        elif dataset.task.is_binclass:
-            y_pred_torch = torch.special.expit(y_pred_torch)
-
+        if use_pair_logit:
+            # Raw logits — no transformation needed for pair logit
+            y_pred = y_pred_torch.cpu().numpy()
+            
+            assert eval_pairs_t is not None
+            pos_idx, neg_idx = eval_pairs_t[part]
+            pred_pos = y_pred[:, pos_idx.cpu().numpy()]
+            pred_neg = y_pred[:, neg_idx.cpu().numpy()]
+            pair_acc = (pred_pos > pred_neg).mean(axis=1)
+            
+            metrics[part] = {
+                'pair_accuracy': pair_acc,
+                'score': pair_acc,  # score = pair_accuracy (higher is better)
+            }
         else:
-            assert dataset.task.is_multiclass
-            y_pred_torch = torch.special.softmax(y_pred_torch, dim=-1)
+            if dataset.task.is_regression:
+                assert regression_label_stats is not None
+                y_pred_torch *= regression_label_stats.std
+                y_pred_torch += regression_label_stats.mean
 
-        y_pred = y_pred_torch.cpu().numpy()
+            elif dataset.task.is_binclass:
+                y_pred_torch = torch.special.expit(y_pred_torch)
 
-        assert np.isfinite(y_pred).all()
-        metrics[part] = bin.tabpack.metrics.calculate_metrics_pack(
-            y_true=dataset.task.labels[part],
-            y_pred=y_pred,
-            task_type=dataset.task.type_,
-            prediction_type=prediction_type,
-            score=dataset.task.score,
-        )
+            else:
+                assert dataset.task.is_multiclass
+                y_pred_torch = torch.special.softmax(y_pred_torch, dim=-1)
+
+            y_pred = y_pred_torch.cpu().numpy()
+
+            assert np.isfinite(y_pred).all()
+            metrics[part] = bin.tabpack.metrics.calculate_metrics_pack(
+                y_true=dataset.task.labels[part],
+                y_pred=y_pred,
+                task_type=dataset.task.type_,
+                prediction_type=prediction_type,
+                score=dataset.task.score,
+            )
         predictions[part] = y_pred
         predictions_torch[part] = y_pred_torch
 
@@ -1062,6 +1100,76 @@ def _make_loss_fn_pack(task_type: TaskType) -> Callable[[Tensor, Tensor], Tensor
     return loss_fn_pack
 
 
+def form_pairs(
+    keys: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Form adjacent pairs within each key group.
+    
+    Assumes keys are contiguous (objects with the same key are consecutive).
+    Fully vectorized O(n) implementation for large datasets (50M+ rows).
+    
+    Handles:
+    - Keys with 1 object: skipped (no pairs formed)
+    - Keys with 2 objects: 1 pair formed
+    - Keys with 3+ objects: all adjacent pairs formed (e.g., [0,1,0] → 2 pairs)
+    
+    Returns:
+        pair_pos_indices: (n_pairs,) int64 — indices of positive objects
+        pair_neg_indices: (n_pairs,) int64 — indices of negative objects
+    """
+    # Find adjacent pairs with the same key
+    same_key = keys[:-1] == keys[1:]  # (n-1,)
+    pair_starts = np.where(same_key)[0]
+    
+    # Get labels for both elements of each pair
+    l0 = labels[pair_starts]
+    l1 = labels[pair_starts + 1]
+    
+    # Identify which element is positive (label=1) and which is negative (label=0)
+    # Pairs where both are positive or both are negative are automatically skipped
+    mask_pos_first = (l0 == 1) & (l1 == 0)
+    mask_pos_second = (l0 == 0) & (l1 == 1)
+    
+    # Build positive and negative index arrays
+    pos_first = pair_starts[mask_pos_first]
+    neg_first = pair_starts[mask_pos_first] + 1
+    pos_second = pair_starts[mask_pos_second] + 1
+    neg_second = pair_starts[mask_pos_second]
+    
+    # Concatenate and sort by the first index of each pair to preserve order
+    pos_indices = np.concatenate([pos_first, pos_second])
+    neg_indices = np.concatenate([neg_first, neg_second])
+    
+    # Sort by the minimum index in each pair to preserve original order
+    pair_min_idx = np.minimum(pos_indices, neg_indices)
+    sort_order = np.argsort(pair_min_idx)
+    
+    pos_indices = pos_indices[sort_order]
+    neg_indices = neg_indices[sort_order]
+    
+    return pos_indices, neg_indices
+
+
+def _make_pair_logit_loss_fn_pack() -> Callable[[Tensor, Tensor], Tensor]:
+    """Create a pair logit loss function for pack training.
+    
+    The loss encourages pred_pos > pred_neg for each pair.
+    Uses BCEWithLogits on (pred_pos - pred_neg) with target=1.
+    
+    Returns:
+        Loss function that takes (pred_pos, pred_neg) and returns (pack_size,) tensor.
+    """
+    def loss_fn_pack(pred_pos: Tensor, pred_neg: Tensor) -> Tensor:
+        # pred_pos, pred_neg: (pack_size, batch_size)
+        diff = pred_pos - pred_neg
+        losses = nn.functional.binary_cross_entropy_with_logits(
+            diff, torch.ones_like(diff), reduction='none'
+        )
+        return losses.mean(dim=BATCH_DIM)  # (pack_size,)
+    
+    return loss_fn_pack
+
+
 def _get_mean_scores(
     current_mean_scores: None | dict[PartKey, float],
     experiments: list[ExperimentDict],
@@ -1143,6 +1251,7 @@ class Config(TypedDict):
     batch_size: int
     n_epochs: int
     patience: int
+    loss: NotRequired[str]  # 'default' or 'pair_logit'
 
     # Evaluation
     eval_parts: NotRequired[list[PartKey]]
@@ -1341,12 +1450,50 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
 
     assert dataset.n_bin_features == 0
     print(f'Dataset loaded: {dataset.size("train")} train, {dataset.size("val")} val, {dataset.size("test")} test')
+    
+    # >>> Pair logit setup
+    use_pair_logit = config.get('loss') == 'pair_logit'
+    eval_parts = config.get('eval_parts', ['val', 'test'])
+    
+    if use_pair_logit:
+        assert 'key' in dataset.data, "key.npy is required for pair_logit loss"
+        
+        # Form pairs for train
+        train_pair_pos, train_pair_neg = form_pairs(
+            dataset.data['key']['train'],
+            dataset.task.labels['train'],
+        )
+        print(f'Formed {len(train_pair_pos)} training pairs')
+        
+        # Form pairs for val/test (for evaluation)
+        eval_pairs = {}
+        for part in eval_parts:
+            if part in dataset.data['key']:
+                eval_pairs[part] = form_pairs(
+                    dataset.data['key'][part],
+                    dataset.task.labels[part],
+                )
+                print(f'Formed {len(eval_pairs[part][0])} {part} pairs')
+    
     regression_label_stats = dataset.try_standardize_labels_()
     print('Moving data to GPU...')
     dataset = dataset.to_torch(device)
     # Free numpy arrays that were replaced by torch tensors on GPU.
     _free_mps_memory()
     print('Data on GPU, freed numpy arrays')
+    
+    # Convert pair indices to GPU tensors
+    if use_pair_logit:
+        train_pair_pos_t = torch.tensor(train_pair_pos, device=device, dtype=torch.long)
+        train_pair_neg_t = torch.tensor(train_pair_neg, device=device, dtype=torch.long)
+        eval_pairs_t = {
+            part: (
+                torch.tensor(pos, device=device, dtype=torch.long),
+                torch.tensor(neg, device=device, dtype=torch.long),
+            )
+            for part, (pos, neg) in eval_pairs.items()
+        }
+    
     n_classes = dataset.task.try_compute_n_classes()
     Y_train = _make_Y_train(dataset)
     train_size = dataset.size('train')
@@ -1404,9 +1551,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # NOTE
     # Predictions must be stored in aggregation-friendly units
     # for ensembling purposes (raw logits do _not_ meet this requirement).
-    prediction_type = (
-        PredictionType.LABELS if dataset.task.is_regression else PredictionType.PROBS
-    )
+    # For pair logit, we use LOGITS since we want raw scores for ranking.
+    if use_pair_logit:
+        prediction_type = PredictionType.LOGITS
+    else:
+        prediction_type = (
+            PredictionType.LABELS if dataset.task.is_regression else PredictionType.PROBS
+        )
     apply_model = apply_model_impl if autocast is None else autocast(apply_model_impl)
 
     # >>> Ensembles
@@ -1460,8 +1611,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     del configs_T
 
-    loss_fn = _make_loss_fn_pack(dataset.task.type_)
-    epoch_size = math.ceil(train_size / config['batch_size'])
+    if use_pair_logit:
+        loss_fn = _make_pair_logit_loss_fn_pack()
+        n_train_pairs = len(train_pair_pos)
+        epoch_size = math.ceil(n_train_pairs / config['batch_size'])
+    else:
+        loss_fn = _make_loss_fn_pack(dataset.task.type_)
+        epoch_size = math.ceil(train_size / config['batch_size'])
 
     # >>> Evaluation
     # The following order of `torch.inference_mode` and `partial` preserves
@@ -1476,6 +1632,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             regression_label_stats=regression_label_stats,
             prediction_type=prediction_type,
             device=device,
+            use_pair_logit=use_pair_logit,
+            eval_pairs_t=eval_pairs_t if use_pair_logit else None,
         )
     )
     logger.debug('Created the evaluation function')
@@ -1571,12 +1729,20 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         epoch_training_start_time = time.perf_counter()
         model.train()
 
-        batches = generate_training_batches(
-            train_size=train_size,
-            batch_size=config['batch_size'],
-            batch_generator=batch_generator,
-            pack_size=state.pack_size,
-        )
+        if use_pair_logit:
+            batches = generate_pair_training_batches(
+                n_pairs=n_train_pairs,
+                batch_size=config['batch_size'],
+                batch_generator=batch_generator,
+                pack_size=state.pack_size,
+            )
+        else:
+            batches = generate_training_batches(
+                train_size=train_size,
+                batch_size=config['batch_size'],
+                batch_generator=batch_generator,
+                pack_size=state.pack_size,
+            )
         batch_losses = []
         batch_sizes = []
         for batch_idx in tqdm(
@@ -1585,10 +1751,20 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             leave=False,
             disable=not lib.env.is_local(),
         ):
-            losses = loss_fn(
-                apply_model(model, dataset, part='train', batch_idx=batch_idx),
-                Y_train[batch_idx],
-            )
+            if use_pair_logit:
+                pos_idx = train_pair_pos_t[batch_idx]  # (pack_size, batch_size)
+                neg_idx = train_pair_neg_t[batch_idx]  # (pack_size, batch_size)
+                all_idx = torch.cat([pos_idx, neg_idx], dim=BATCH_DIM)  # (pack_size, 2*batch_size)
+                all_preds = apply_model(model, dataset, part='train', batch_idx=all_idx)
+                bs = batch_idx.shape[BATCH_DIM]
+                pred_pos = all_preds[:, :bs]
+                pred_neg = all_preds[:, bs:]
+                losses = loss_fn(pred_pos, pred_neg)
+            else:
+                losses = loss_fn(
+                    apply_model(model, dataset, part='train', batch_idx=batch_idx),
+                    Y_train[batch_idx],
+                )
             # The scale of the gradients should not depend on the number of models,
             # so the individual losses are summed, not averaged.
             loss = losses.sum()

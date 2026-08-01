@@ -156,6 +156,9 @@ def evaluate_ensemble(
 
     prediction_type = PredictionType(artifact['prediction_type'])
     regression_label_stats = artifact.get('regression_label_stats')
+    
+    # Detect pair logit model
+    use_pair_logit = prediction_type == PredictionType.LOGITS
 
     # Reconstruct RegressionLabelStats if needed
     reg_stats = None
@@ -164,6 +167,21 @@ def evaluate_ensemble(
             mean=regression_label_stats['mean'],
             std=regression_label_stats['std'],
         )
+    
+    # Form pairs for evaluation if pair logit model
+    eval_pairs_t = None
+    if use_pair_logit and 'key' in dataset.data:
+        eval_pairs_t = {}
+        for part in parts:
+            if part in dataset.data['key']:
+                pos, neg = bin.tabpack.tabpack.form_pairs(
+                    dataset.data['key'][part],
+                    dataset.task.labels[part],
+                )
+                eval_pairs_t[part] = (
+                    torch.tensor(pos, device=device, dtype=torch.long),
+                    torch.tensor(neg, device=device, dtype=torch.long),
+                )
 
     # Move dataset to torch
     dataset_torch = dataset.to_torch(device)
@@ -184,6 +202,8 @@ def evaluate_ensemble(
             prediction_type=prediction_type,
             batch_size=batch_size,
             device=device,
+            use_pair_logit=use_pair_logit,
+            eval_pairs_t=eval_pairs_t,
         )
         # _evaluate returns tuple (result, batch_size) due to decorator
         if isinstance(eval_result, tuple):
@@ -209,15 +229,19 @@ def evaluate_ensemble(
         
         ensemble_predictions[part] = avg_pred
 
-        # Calculate metrics for the averaged prediction using lib.metrics
-        # which provides full classification_report (f1, precision, recall, roc-auc)
-        import lib.metrics
-        ensemble_metrics[part] = lib.metrics.calculate_metrics(
-            y_true=dataset.task.labels[part],
-            y_pred=avg_pred,
-            task_type=dataset.task.type_,
-            prediction_type=prediction_type,
-        )
+        if use_pair_logit:
+            # For pair logit, metrics are already computed in _evaluate
+            ensemble_metrics[part] = result.metrics[part]
+        else:
+            # Calculate metrics for the averaged prediction using lib.metrics
+            # which provides full classification_report (f1, precision, recall, roc-auc)
+            import lib.metrics
+            ensemble_metrics[part] = lib.metrics.calculate_metrics(
+                y_true=dataset.task.labels[part],
+                y_pred=avg_pred,
+                task_type=dataset.task.type_,
+                prediction_type=prediction_type,
+            )
 
     return {
         'metrics': ensemble_metrics,
@@ -390,7 +414,10 @@ def main():
     for part in args.parts:
         metrics = result['metrics'][part]
         print(f'  [{part}]')
-        # Show key metrics: accuracy, roc-auc, f1-macro, f1-micro
+        # Show key metrics: pair_accuracy (for pair logit), accuracy, roc-auc, f1-macro, f1-micro
+        if 'pair_accuracy' in metrics:
+            pair_acc = metrics['pair_accuracy']
+            print(f'    pair_accuracy:  {pair_acc:.4f}' if isinstance(pair_acc, float) else f'    pair_accuracy:  {pair_acc[0]:.4f}')
         if 'accuracy' in metrics:
             acc = metrics['accuracy']
             print(f'    accuracy:  {acc:.4f}' if isinstance(acc, float) else f'    accuracy:  {acc[0]:.4f}')
