@@ -1005,23 +1005,36 @@ def _make_online_ensembles(
     prediction_type: PredictionType,
     update_part: PartKey,
     device: torch.device,
+    use_pair_logit: bool = False,
+    eval_pairs_t: dict[PartKey, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> dict[str, OnlineEnsemble]:
-    score_fn = bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
-        task,
-        prediction_type,
-        part=update_part,
-        device=device,
-    )
-    loss_score_fn = (
-        bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
-            dataclasses.replace(task, score=lib.data.Score.CROSS_ENTROPY),
+    if use_pair_logit:
+        # For pair_logit, use pair accuracy as score function
+        assert eval_pairs_t is not None, "eval_pairs_t required for pair_logit"
+        pair_pos_indices, pair_neg_indices = eval_pairs_t[update_part]
+        score_fn = bin.tabpack.ensemble_utils_torch.make_pair_accuracy_score_fn(
+            pair_pos_indices,
+            pair_neg_indices,
+            device=device,
+        )
+        loss_score_fn = None  # Not applicable for pair_logit
+    else:
+        score_fn = bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
+            task,
             prediction_type,
             part=update_part,
             device=device,
         )
-        if task.is_classification
-        else None
-    )
+        loss_score_fn = (
+            bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
+                dataclasses.replace(task, score=lib.data.Score.CROSS_ENTROPY),
+                prediction_type,
+                part=update_part,
+                device=device,
+            )
+            if task.is_classification
+            else None
+        )
 
     online_ensembles = {}
     for name, ensemble_config in online_ensemble_configs.items():
@@ -1564,14 +1577,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     apply_model = apply_model_impl if autocast is None else autocast(apply_model_impl)
 
     # >>> Ensembles
-    # NOTE: Online ensembles are not supported for pair logit (LOGITS prediction type)
-    # because ensemble_utils_torch.py only supports PROBS and LABELS
     online_ensemble_configs = config.get('online_ensembles')
-    if online_ensemble_configs is None or use_pair_logit:
+    if online_ensemble_configs is None:
         online_ensembles = None
         online_ensemble_history = None
-        if use_pair_logit and online_ensemble_configs is not None:
-            logger.warning('Online ensembles are disabled for pair_logit loss')
     else:
         online_ensembles = _make_online_ensembles(
             online_ensemble_configs,
@@ -1579,6 +1588,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             prediction_type=prediction_type,
             update_part='val',
             device=device,
+            use_pair_logit=use_pair_logit,
+            eval_pairs_t=eval_pairs_t if use_pair_logit else None,
         )
         online_ensemble_history = {}
     logger.debug('Created the ensembles')
