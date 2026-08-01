@@ -805,6 +805,8 @@ def update_online_ensembles(
     task: lib.data.Task,
     step: int,
     timer: delu.tools.Timer,
+    use_pair_logit: bool = False,
+    eval_pairs_t: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     **kwargs,
 ) -> tuple[dict[str, lib.experiment.Report], bool]:
     reports = {}
@@ -827,6 +829,17 @@ def update_online_ensembles(
             metrics = task.calculate_metrics(
                 ensemble_predictions, ensemble._prediction_type
             )
+
+            # Add pair accuracy for pair logit models
+            if use_pair_logit and eval_pairs_t is not None:
+                for part, (pos_idx, neg_idx) in eval_pairs_t.items():
+                    if part in ensemble_predictions:
+                        pred = ensemble_predictions[part]
+                        pred_pos = pred[pos_idx]
+                        pred_neg = pred[neg_idx]
+                        pair_acc = float((pred_pos > pred_neg).float().mean())
+                        metrics[part]['pair_accuracy'] = pair_acc
+                        metrics[part]['score'] = pair_acc
 
             reports[ensemble_name] = {
                 'ids': ensemble.ids.tolist(),
@@ -1981,6 +1994,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 task=dataset.task,
                 step=step,
                 timer=timer,
+                use_pair_logit=use_pair_logit,
+                eval_pairs_t=eval_pairs_t,
                 running_ids=state.ids,
                 running_steps=state.steps,
                 running_best_predictions=state.best_predictions,
@@ -2004,6 +2019,19 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                         online_ensemble_history[ensemble_name]
                     )
                 del ensemble_name, ensemble_report
+
+            # Update pair_accuracy in report with ensemble pair accuracy
+            if use_pair_logit and ensemble_reports:
+                first_ensemble_report = next(iter(ensemble_reports.values()))
+                if 'pair_accuracy' in first_ensemble_report.get('metrics', {}).get('val', {}):
+                    ensemble_pair_accuracy = {
+                        part: metrics.get('pair_accuracy', 0.0)
+                        for part, metrics in first_ensemble_report['metrics'].items()
+                        if 'pair_accuracy' in metrics
+                    }
+                    report['pair_accuracy'] = ensemble_pair_accuracy
+                    # Also update pair_accuracy_scores for console output
+                    pair_accuracy_scores = ensemble_pair_accuracy
 
             # Save ensemble snapshot when improved ($ appears)
             # This is necessary for update_type='latest' because the ensemble is built
@@ -2089,7 +2117,11 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 iter(report['online_ensembles'].values())
             )
             first_online_ensemble_scores = {
-                part: part_metrics['score']
+                part: (
+                    part_metrics.get('pair_accuracy', part_metrics['score'])
+                    if use_pair_logit
+                    else part_metrics['score']
+                )
                 for part, part_metrics in (
                     first_online_ensemble_experiment['report']
                     .get('metrics', {})
