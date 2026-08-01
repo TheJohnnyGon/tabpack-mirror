@@ -1975,10 +1975,6 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 )
             report['time'] = timer.elapsed()
             
-            # Save pair accuracy for pair logit
-            if use_pair_logit and pair_accuracy_scores is not None:
-                report['pair_accuracy'] = pair_accuracy_scores
-
             # Make the update visible.
             lib.experiment.dump_report(exp, report)
 
@@ -2023,18 +2019,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     )
                 del ensemble_name, ensemble_report
 
-            # Update pair_accuracy in report with ensemble pair accuracy
+            # Save pair_accuracy from ensemble to report for summary.txt
             if use_pair_logit and ensemble_reports:
                 first_ensemble_report = next(iter(ensemble_reports.values()))
-                if 'pair_accuracy' in first_ensemble_report.get('metrics', {}).get('val', {}):
-                    ensemble_pair_accuracy = {
-                        part: metrics.get('pair_accuracy', 0.0)
-                        for part, metrics in first_ensemble_report['metrics'].items()
-                        if 'pair_accuracy' in metrics
-                    }
-                    report['pair_accuracy'] = ensemble_pair_accuracy
-                    # Also update pair_accuracy_scores for console output
-                    pair_accuracy_scores = ensemble_pair_accuracy
+                report['pair_accuracy'] = {
+                    part: metrics.get('pair_accuracy', 0.0)
+                    for part, metrics in first_ensemble_report['metrics'].items()
+                    if 'pair_accuracy' in metrics
+                }
 
             # Save ensemble snapshot when improved ($ appears)
             # This is necessary for update_type='latest' because the ensemble is built
@@ -2152,24 +2144,26 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 f'[{part[0]}*] {score:.3f}' for part, score in best_scores.items()
             )
         )
+        ensemble_suffix = '@' if use_pair_logit else '$'
         first_online_ensemble_scores_message = (
             None
             if first_online_ensemble_scores is None or not first_online_ensemble_scores
             else ' '.join(
-                f'[{part[0]}$] {score:.3f}'
+                f'[{part[0]}{ensemble_suffix}] {score:.3f}'
                 for part, score in first_online_ensemble_scores.items()
             )
         )
         pair_accuracy_message = (
             None
-            if pair_accuracy_scores is None
+            # For pair_logit, pair accuracy is shown in ensemble output, skip [v@]
+            if pair_accuracy_scores is None or use_pair_logit
             else ' '.join(
                 f'[{part[0]}@] {score:.3f}'
                 for part, score in pair_accuracy_scores.items()
             )
         )
         print(
-            f'{"$" if first_online_ensemble_improved else " "}'
+            f'{ensemble_suffix if first_online_ensemble_improved else " "}'
             f'{"*" if best_scores_improved else " "}'
             f' [E] {step // epoch_size:<3}'
             f' [T] {datetime.timedelta(seconds=math.trunc(timer.elapsed()))}'
