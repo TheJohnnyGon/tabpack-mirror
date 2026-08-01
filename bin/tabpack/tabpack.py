@@ -1487,11 +1487,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         train_pair_pos_t = torch.tensor(train_pair_pos, device=device, dtype=torch.long)
         train_pair_neg_t = torch.tensor(train_pair_neg, device=device, dtype=torch.long)
         eval_pairs_t = {
-            part: (
-                torch.tensor(pos, device=device, dtype=torch.long),
-                torch.tensor(neg, device=device, dtype=torch.long),
-            )
-            for part, (pos, neg) in eval_pairs.items()
+            'train': (train_pair_pos_t, train_pair_neg_t),
+            **{
+                part: (
+                    torch.tensor(pos, device=device, dtype=torch.long),
+                    torch.tensor(neg, device=device, dtype=torch.long),
+                )
+                for part, (pos, neg) in eval_pairs.items()
+            }
         }
     
     n_classes = dataset.task.try_compute_n_classes()
