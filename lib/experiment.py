@@ -469,6 +469,12 @@ def _summarize_report(report: Report) -> JSONDict:
                 for part, part_metrics in value.items()
             }
 
+        elif key == 'pair_accuracy':
+            summary['pair_accuracy'] = {
+                part: _summarize_score(score)
+                for part, score in value.items()
+            }
+
         elif key == 'best':
             summary['best'] = _summarize_report(value['report'])
 

@@ -1561,10 +1561,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     apply_model = apply_model_impl if autocast is None else autocast(apply_model_impl)
 
     # >>> Ensembles
+    # NOTE: Online ensembles are not supported for pair logit (LOGITS prediction type)
+    # because ensemble_utils_torch.py only supports PROBS and LABELS
     online_ensemble_configs = config.get('online_ensembles')
-    if online_ensemble_configs is None:
+    if online_ensemble_configs is None or use_pair_logit:
         online_ensembles = None
         online_ensemble_history = None
+        if use_pair_logit and online_ensemble_configs is not None:
+            logger.warning('Online ensembles are disabled for pair_logit loss')
     else:
         online_ensembles = _make_online_ensembles(
             online_ensemble_configs,
@@ -1686,6 +1690,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     best_scores_improved = False
     first_online_ensemble_scores = None
     first_online_ensemble_improved = False
+    
+    # For pair logit, track pair accuracy for logging
+    pair_accuracy_scores = None
 
     # >>> Report
     report['n_models'] = 0
@@ -1811,6 +1818,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             predictions_torch=eval_predictions_torch,
             model_state_dict=model.state_dict(),
         )
+        
+        # Update pair accuracy scores for logging
+        if use_pair_logit:
+            pair_accuracy_scores = {
+                part: float(np.mean(metrics['pair_accuracy']))
+                for part, metrics in eval_metrics.items()
+            }
 
         pack_epochs_numlog.append(
             deepcopy(
@@ -1930,6 +1944,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     report.get('best'), new_experiments
                 )
             report['time'] = timer.elapsed()
+            
+            # Save pair accuracy for pair logit
+            if use_pair_logit and pair_accuracy_scores is not None:
+                report['pair_accuracy'] = pair_accuracy_scores
 
             # Make the update visible.
             lib.experiment.dump_report(exp, report)
@@ -2093,6 +2111,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 for part, score in first_online_ensemble_scores.items()
             )
         )
+        pair_accuracy_message = (
+            None
+            if pair_accuracy_scores is None
+            else ' '.join(
+                f'[{part[0]}@] {score:.3f}'
+                for part, score in pair_accuracy_scores.items()
+            )
+        )
         print(
             f'{"$" if first_online_ensemble_improved else " "}'
             f'{"*" if best_scores_improved else " "}'
@@ -2103,6 +2129,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             f'{"" if mean_scores_message is None else f" {mean_scores_message}"}'
             f'{"" if best_scores_message is None else f" {best_scores_message}"}'
             f'{"" if first_online_ensemble_scores_message is None else f" {first_online_ensemble_scores_message}"}'  # noqa: E501
+            f'{"" if pair_accuracy_message is None else f" {pair_accuracy_message}"}'
             f' [it/s] {training_throughput:<3} | {total_training_throughput:<5}'
             # f' [e/t] {epoch_evaluation_duration / epoch_training_duration:.3f}'
         )
