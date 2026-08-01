@@ -835,9 +835,12 @@ def update_online_ensembles(
                 for part, (pos_idx, neg_idx) in eval_pairs_t.items():
                     if part in ensemble_predictions:
                         pred = ensemble_predictions[part]
-                        pred_pos = pred[pos_idx]
-                        pred_neg = pred[neg_idx]
-                        pair_acc = float((pred_pos > pred_neg).float().mean())
+                        # Convert torch indices to numpy for indexing numpy predictions
+                        pos_idx_np = pos_idx.cpu().numpy()
+                        neg_idx_np = neg_idx.cpu().numpy()
+                        pred_pos = pred[pos_idx_np]
+                        pred_neg = pred[neg_idx_np]
+                        pair_acc = float((pred_pos > pred_neg).mean())
                         metrics[part]['pair_accuracy'] = pair_acc
                         metrics[part]['score'] = pair_acc
 
