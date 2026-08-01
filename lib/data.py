@@ -38,19 +38,6 @@ _Y_REG_DTYPE = np.float32
 _Y_CLF_DTYPE = np.int64
 _SPLIT_DTYPE = np.int32
 
-# Global variables to store feature indices after preprocessing
-# These are populated by build_dataset() and can be saved to model.pt
-FEATURE_INDICES_NUM: np.ndarray | None = None
-FEATURE_INDICES_CAT: np.ndarray | None = None
-FEATURE_INDICES_BIN: np.ndarray | None = None
-
-# Global variables to store fitted transformers after preprocessing
-# These are populated by transform_num() and transform_cat() and can be saved to model.pt
-TRANSFORMER_NUM: sklearn.preprocessing.StandardScaler | sklearn.preprocessing.QuantileTransformer | None = None
-TRANSFORMER_CAT_ORDINAL: sklearn.preprocessing.OrdinalEncoder | None = None
-TRANSFORMER_CAT_ONEHOT: sklearn.preprocessing.OneHotEncoder | None = None
-
-
 class DataPreprocessor:
     """
     Препроцессор данных с паттерном fit/transform.
@@ -569,8 +556,6 @@ def transform_num(
             X_num_transformed[k] = normalizer.transform(v)
             del v
         X_num = X_num_transformed
-        global TRANSFORMER_NUM
-        TRANSFORMER_NUM = normalizer
         del normalizer
         gc.collect()
 
@@ -770,8 +755,6 @@ def transform_cat(
     for k, v in X_cat.items():
         X_cat_encoded[k] = encoder.transform(v)
         del v
-    global TRANSFORMER_CAT_ORDINAL
-    TRANSFORMER_CAT_ORDINAL = encoder
     del X_cat, encoder
 
     max_values = X_cat_encoded['train'].max(axis=0)
@@ -796,8 +779,6 @@ def transform_cat(
         for k, v in X_cat_encoded.items():
             X_cat_onehot[k] = cast(np.ndarray, encoder.transform(v))
             del v
-        global TRANSFORMER_CAT_ONEHOT
-        TRANSFORMER_CAT_ONEHOT = encoder
         del X_cat_encoded, encoder
         gc.collect()
         return X_cat_onehot
@@ -1058,35 +1039,17 @@ def build_dataset(
             dataset, task=dataclasses.replace(dataset.task, score=Score(task_score))
         )
 
-    # Reset global feature indices
-    global FEATURE_INDICES_NUM, FEATURE_INDICES_CAT, FEATURE_INDICES_BIN
-    FEATURE_INDICES_NUM = None
-    FEATURE_INDICES_CAT = None
-    FEATURE_INDICES_BIN = None
-
     if 'x_num' in dataset.data and extract_bin_from_num:
         print('Extracting binary features from numerical...')
-        
-        # Compute binary feature indices before extraction
-        x_num_all = np.concatenate(list(dataset.data['x_num'].values()))
-        has_missing = np.any(np.isnan(x_num_all), 0)
-        unique_counts = np.array([len(np.unique(col)) for col in x_num_all.T])
-        bin_mask = (unique_counts == 2) & ~has_missing
-        bin_indices = np.nonzero(bin_mask)[0]
-        num_indices = np.nonzero(~bin_mask)[0]
-        del x_num_all, has_missing, unique_counts, bin_mask
         
         extracted_x_bin, remaining_x_num = _extract_bin_from_num(
             dataset.data['x_num'], skip_encoder=skip_bin_encoder
         )
         if extracted_x_bin is not None:
-            # Store feature indices
-            FEATURE_INDICES_BIN = bin_indices
             if remaining_x_num is None:
                 del dataset.data['x_num']
             else:
                 dataset.data['x_num'] = remaining_x_num
-                FEATURE_INDICES_NUM = num_indices
             x_bin = dataset.data.pop('x_bin', None)
             if x_bin is None:
                 dataset.data['x_bin'] = extracted_x_bin
