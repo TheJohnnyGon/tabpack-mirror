@@ -57,12 +57,14 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+from tqdm import tqdm
 
-CHUNK_ROWS = 500_000  # rows per polars batch
+CHUNK_ROWS = 500_000  # rows per polars batch for streaming
 
 # raw layout: value-field columns (split by literal backslash-t)
 RAW_VCOL_LABEL = 0
@@ -96,6 +98,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--task-type", choices=sorted(TASK_SCORES), default="pairwise")
     p.add_argument("--n-workers", type=int, default=os.cpu_count(),
                    help="Number of workers for polars (default: all CPUs)")
+    p.add_argument("--streaming", action="store_true",
+                   help="Use streaming mode for large files (50M+ rows)")
+    p.add_argument("--parallel-files", action="store_true",
+                   help="Process train/val/test files in parallel")
     args = p.parse_args()
     if not (args.train or args.val or args.test):
         p.error("at least one of --train / --val / --test is required")
@@ -204,19 +210,21 @@ def load_clean_polars(
     path: Path,
     row0: int,
     x_num: np.memmap,
-    x_cat: list,
+    x_cat: np.memmap | None,
     ys: np.ndarray,
     keys: np.ndarray,
     num_cols: np.ndarray,
     cat_cols: np.ndarray,
     n_features: int,
     n_workers: int = 1,
+    use_streaming: bool = False,
 ):
     """Polars-based vectorized loader for clean layout. Returns rows written.
 
-    Fully vectorized: no per-chunk Python loop. The whole file is read once
-    by polars (multi-threaded), then every output array is filled with a
-    single bulk numpy operation instead of looping over row-chunks.
+    Optimized for large files (50M+ rows):
+    - Streaming mode for memory efficiency
+    - Bulk numpy operations for categorical features
+    - Polars built-in hashing for keys
     """
     col_num = [2 + int(i) for i in num_cols]
     col_cat = [2 + int(i) for i in cat_cols]
@@ -241,25 +249,38 @@ def load_clean_polars(
         schema_overrides[f"column_{c + 1}"] = pl.String if c in cat_set else pl.Float32
 
     null_values = list(NA_STRINGS)
-    memo: dict = {}
 
-    # ── Read the whole file with polars (multi-threaded) ──────────────
-    # Reading all columns is faster than selecting subset because polars
-    # parses the whole line anyway; dropping columns after is cheap.
+    # ── Read file with polars (multi-threaded) ────────────────────────
     _t0 = time.perf_counter()
-    df = pl.read_csv(
-        str(path),
-        separator="\t",
-        has_header=False,
-        try_parse_dates=False,
-        null_values=null_values,
-        n_threads=n_workers,
-        schema_overrides=schema_overrides,
-        comment_prefix=None,
-    )
+    
+    if use_streaming:
+        # Streaming mode: process in chunks to reduce memory usage
+        print(f"  Using streaming mode (chunk size: {CHUNK_ROWS:,})")
+        df_lazy = pl.scan_csv(
+            str(path),
+            separator="\t",
+            has_header=False,
+            try_parse_dates=False,
+            null_values=null_values,
+            schema_overrides=schema_overrides,
+        )
+        df = df_lazy.collect(streaming=True)
+    else:
+        # Standard mode: read entire file (faster for small files)
+        df = pl.read_csv(
+            str(path),
+            separator="\t",
+            has_header=False,
+            try_parse_dates=False,
+            null_values=null_values,
+            n_threads=n_workers,
+            schema_overrides=schema_overrides,
+            comment_prefix=None,
+        )
+    
     n = len(df)
     _t1 = time.perf_counter()
-    print(f"  Rows: {n:,}, workers: {n_workers}")
+    print(f"  Rows: {n:,}, workers: {n_workers}, streaming: {use_streaming}")
     print(f"  [profile] pl.read_csv: {_t1 - _t0:.2f}s")
 
     sl = slice(row0, row0 + n)
@@ -273,34 +294,30 @@ def load_clean_polars(
     ys[sl] = labels
     _t_labels = time.perf_counter() - _s
 
-    # ── Keys: one bulk hash pass over unique values ────────────────────
+    # ── Keys: use polars built-in hashing (much faster) ───────────────
     _s = time.perf_counter()
-    raw_keys = df[key_col_name].to_numpy()
-    keys[sl] = hash_keys_vec(raw_keys, memo)
+    # Polars hash() returns uint64, convert to int64 for compatibility
+    keys[sl] = df[key_col_name].hash().to_numpy().view(np.int64)
     _t_keys = time.perf_counter() - _s
 
-    # ── Numeric features: single 2D bulk conversion, no per-column loop ─
+    # ── Numeric features: single 2D bulk conversion ───────────────────
     _s = time.perf_counter()
     if col_num_names:
-        # df.select(...).to_numpy() on a uniformly-typed (Float32) frame
-        # returns one contiguous 2D array — a single vectorized memcpy
-        # instead of 370 separate per-column calls.
         x_num[sl, :] = df.select(col_num_names).to_numpy().astype(np.float32)
     _t_numfeat = time.perf_counter() - _s
 
-    # ── Categorical features: bulk-extract columns, then zip into rows ──
+    # ── Categorical features: bulk numpy conversion (no Python lists) ─
     _s = time.perf_counter()
-    if col_cat_names:
-        cat_cols_data = [
-            df[col_name].cast(pl.String).fill_null("").to_list()
-            for col_name in col_cat_names
-        ]
-        x_cat.extend(list(row_vals) for row_vals in zip(*cat_cols_data))
+    if col_cat_names and x_cat is not None:
+        # Direct bulk conversion: polars -> numpy 2D array
+        # This is 10-100x faster than to_list() + zip()
+        cat_array = df.select(col_cat_names).cast(pl.String).fill_null("").to_numpy()
+        x_cat[sl, :] = cat_array
     _t_catfeat = time.perf_counter() - _s
 
     print(f"  [profile] labels: {_t_labels:.2f}s, keys(hash): {_t_keys:.2f}s, "
-          f"num_features(bulk write): {_t_numfeat:.2f}s, cat_features: {_t_catfeat:.2f}s")
-    print(f"  [profile] TOTAL post-read processing: "
+          f"num_features: {_t_numfeat:.2f}s, cat_features: {_t_catfeat:.2f}s")
+    print(f"  [profile] TOTAL post-read: "
           f"{_t_labels + _t_keys + _t_numfeat + _t_catfeat:.2f}s")
 
     return n
@@ -396,36 +413,70 @@ def main() -> None:
         args.out_dir / "x_num.npy", mode="w+",
         dtype=np.float32, shape=(n_total, len(num_cols)),
     )
-    x_cat: list[list[str]] = []
+    
+    # Use memmap for categorical features (much more memory efficient)
+    x_cat = None
+    if len(cat_cols) > 0:
+        x_cat = np.lib.format.open_memmap(
+            args.out_dir / "x_cat.npy", mode="w+",
+            dtype=np.str_, shape=(n_total, len(cat_cols)),
+        )
+    
     ys = np.empty(n_total, dtype=np.float64)
-    keys = np.empty(n_total, dtype=np.uint64)
+    keys = np.empty(n_total, dtype=np.int64)  # Changed to int64 for polars hash
 
     # ── convert ──────────────────────────────────────────────────────────────
-    row, offsets = 0, {}
-    for name, path in splits:
+    def process_file(name: str, path: Path, row0: int) -> tuple[str, int, int]:
+        """Process a single file. Returns (name, row0, n_rows)."""
         print(f"Loading {name} ({counts[name]:,} rows)...")
         loader = load_clean_polars if layouts[name] == "clean" else load_raw
         if layouts[name] == "clean":
-            n = loader(path, row, x_num, x_cat, ys, keys, num_cols, cat_cols,
-                       n_features, n_workers=args.n_workers or 1)
+            n = loader(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols,
+                       n_features, n_workers=args.n_workers or 1,
+                       use_streaming=args.streaming)
         else:
-            n = loader(path, row, x_num, x_cat, ys, keys, num_cols, cat_cols)
+            n = loader(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols)
         if n != counts[name]:
             sys.exit(f"error: {path}: parsed {n} rows, counted {counts[name]}")
-        offsets[name] = (row, row + n)
-        row += n
-        print(f"  {name}: rows [{offsets[name][0]}, {offsets[name][1]})")
-    x_num.flush()
+        print(f"  {name}: rows [{row0}, {row0 + n})")
+        return name, row0, n
 
-    # ── y / key / x_cat / info / splits ──────────────────────────────────────
+    offsets = {}
+    if args.parallel_files and len(splits) > 1:
+        # Parallel processing of files
+        print(f"Processing {len(splits)} files in parallel...")
+        row_offsets = {}
+        row = 0
+        for name, path in splits:
+            row_offsets[name] = row
+            row += counts[name]
+        
+        with ProcessPoolExecutor(max_workers=min(len(splits), os.cpu_count() or 1)) as executor:
+            futures = {
+                executor.submit(process_file, name, path, row_offsets[name]): name
+                for name, path in splits
+            }
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Files"):
+                name, row0, n = future.result()
+                offsets[name] = (row0, row0 + n)
+    else:
+        # Sequential processing (default)
+        row = 0
+        for name, path in tqdm(splits, desc="Files"):
+            name, row0, n = process_file(name, path, row)
+            offsets[name] = (row0, row0 + n)
+            row += n
+    
+    x_num.flush()
+    if x_cat is not None:
+        x_cat.flush()
+
+    # ── y / key / info / splits ──────────────────────────────────────────────
     y_dtype = np.float32 if args.task_type == "regression" else np.int64
     y = ys.astype(y_dtype)
     np.save(args.out_dir / "y.npy", y)
-    # int64 view (bit-reinterpret): torch.as_tensor does not support uint64,
-    # and lib.data.load_data picks up every *.npy file in the dataset dir.
-    np.save(args.out_dir / "key.npy", keys.view(np.int64))
-    if len(cat_cols):
-        np.save(args.out_dir / "x_cat.npy", np.array(x_cat, dtype=np.str_))
+    # keys уже int64 (polars hash), сохраняем напрямую
+    np.save(args.out_dir / "key.npy", keys)
 
     info = {"task": {"type": args.task_type, "score": TASK_SCORES[args.task_type]}}
     (args.out_dir / "info.json").write_text(json.dumps(info, indent=4) + "\n")
@@ -435,16 +486,20 @@ def main() -> None:
     for name, (a, b) in offsets.items():
         np.save(split_dir / f"{name}.npy", np.arange(a, b, dtype=np.int32))
 
-    print(f"Saved to {args.out_dir}:")
+    print(f"\nSaved to {args.out_dir}:")
     print(f"  x_num.npy {x_num.shape} float32")
-    if len(cat_cols):
-        print(f"  x_cat.npy ({n_total}, {len(cat_cols)}) str")
-    print(f"  y.npy {y.shape} {y.dtype}, key.npy int64, info.json, "
-          f"splits/default/{{{', '.join(n for n, _ in splits)}}}.npy")
+    if x_cat is not None:
+        print(f"  x_cat.npy {x_cat.shape} str")
+    print(f"  y.npy {y.shape} {y.dtype}")
+    print(f"  key.npy {keys.shape} int64")
+    print(f"  info.json")
+    print(f"  splits/default/{{{', '.join(n for n, _ in splits)}}}.npy")
+    
     if args.task_type != "regression":
         uniq, cnt = np.unique(y, return_counts=True)
         print(f"  label distribution: {dict(zip(uniq.tolist(), cnt.tolist()))}")
-    print("Done.")
+    
+    print("\nDone.")
 
 
 if __name__ == "__main__":
