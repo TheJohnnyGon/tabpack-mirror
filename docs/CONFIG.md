@@ -421,6 +421,73 @@ while (
 
 ---
 
+### `data_on_cpu: NotRequired[bool]`
+
+**По умолчанию:** `False`
+
+**Назначение:** Хранить данные на CPU и перемещать батчи на GPU во время обучения.
+
+**Когда использовать:**
+- Когда датасет не помещается в GPU память
+- Когда нужно обучать на больших датасетах с ограниченной VRAM
+- Когда overhead от CPU→GPU transfer приемлем
+
+**Использование:**
+```python
+data_on_cpu = config.get('data_on_cpu', False)
+if data_on_cpu:
+    dataset = dataset.to_torch('cpu', pin_memory=True)
+    # Данные остаются на CPU с pinned memory
+    # Батчи перемещаются на GPU в apply_model_impl()
+else:
+    dataset = dataset.to_torch(device)
+    # Все данные на GPU
+```
+
+**Как работает:**
+1. Данные конвертируются в torch тензоры на CPU с `pin_memory=True`
+2. Batch индексы генерируются на CPU
+3. В [`apply_model_impl()`](../bin/tabpack/tabpack.py:158) данные индексируются на CPU
+4. Индексированные батчи перемещаются на GPU через `.to(device, non_blocking=True)`
+5. Модель работает с данными на GPU как обычно
+
+**Преимущества:**
+- Данные любого размера могут быть использованы (ограничение только RAM)
+- Pinned memory ускоряет CPU→GPU transfer
+- Non-blocking transfer позволяет overlap с вычислениями
+
+**Недостатки:**
+- Overhead от CPU→GPU transfer на каждом батче
+- Может быть медленнее для маленьких датасетов, которые помещаются в GPU
+
+**Пример конфигурации:**
+```toml
+seed = 0
+n_models = 64
+batch_size = 1024
+n_epochs = -1
+patience = 16
+data_on_cpu = true  # Данные остаются на CPU
+
+[data]
+path = "data/large_dataset"
+
+[model]
+activation = "SiLU"
+d_block = 384
+
+[optimizer]
+type = "MuonAdamWPack"
+shared_step = true
+```
+
+**Взаимодействие с другими параметрами:**
+- `amp_dtype` — работает как обычно, AMP применяется к данным на GPU
+- `batch_size` — может быть увеличен, так как на GPU только текущий батч
+- `eval_batch_size` — evaluation тоже использует CPU данные
+
+---
+
 ### `track_experiments: NotRequired[bool]`
 
 **По умолчанию:** `True` если `sampler is None`, иначе `False`

@@ -158,11 +158,23 @@ class ApplyModel(Protocol):
 def apply_model_impl(
     model: nn.Module, dataset: lib.data.Dataset, *, part: PartKey, batch_idx: Tensor
 ) -> Tensor:
+    # Get the device from model parameters
+    device = next(model.parameters()).device
+    
+    # Index data (works for both CPU and GPU tensors)
+    # If data is on CPU and batch_idx is on CPU, result is on CPU
+    # Then we move the result to the model's device
+    x_num = dataset.data['x_num'][part][batch_idx] if 'x_num' in dataset.data else None
+    x_cat = dataset.data['x_cat'][part][batch_idx] if 'x_cat' in dataset.data else None
+    
+    # Move indexed batches to model device if needed
+    if x_num is not None and x_num.device != device:
+        x_num = x_num.to(device, non_blocking=True)
+    if x_cat is not None and x_cat.device != device:
+        x_cat = x_cat.to(device, non_blocking=True)
+    
     return (
-        model(
-            dataset.data['x_num'][part][batch_idx] if 'x_num' in dataset.data else None,
-            dataset.data['x_cat'][part][batch_idx] if 'x_cat' in dataset.data else None,
-        )
+        model(x_num, x_cat)
         .squeeze(-1)  # Remove the last dimension for regression predictions.
         .float()
     )
@@ -873,13 +885,19 @@ def generate_training_batches(
     batch_generator: torch.Generator,
     pack_size: int,
 ) -> list[Tensor]:
-    """Generate training batches for one epoch."""
+    """Generate training batches for one epoch.
+    
+    Returns batch indices on CPU for indexing CPU data tensors.
+    The random generation and argsort happen on the generator's device
+    (usually GPU) for speed, then results are moved to CPU.
+    """
     random_values = torch.rand(
         (pack_size, train_size),
         generator=batch_generator,
         device=batch_generator.device,
     )
-    batches = random_values.argsort(dim=BATCH_DIM).split(batch_size, dim=BATCH_DIM)
+    # argsort on GPU for speed, then move to CPU for indexing CPU data
+    batches = random_values.argsort(dim=BATCH_DIM).cpu().split(batch_size, dim=BATCH_DIM)
     batches = list(batches)
     return batches
 
@@ -895,13 +913,16 @@ def generate_pair_training_batches(
     
     Returns list of tensors with shape (pack_size, batch_size) — indices into pair arrays.
     Same per-model shuffling pattern as generate_training_batches().
+    
+    Returns batch indices on CPU for indexing CPU data tensors.
     """
     random_values = torch.rand(
         (pack_size, n_pairs),
         generator=batch_generator,
         device=batch_generator.device,
     )
-    batches = random_values.argsort(dim=BATCH_DIM).split(batch_size, dim=BATCH_DIM)
+    # argsort on GPU for speed, then move to CPU for indexing CPU data
+    batches = random_values.argsort(dim=BATCH_DIM).cpu().split(batch_size, dim=BATCH_DIM)
     return list(batches)
 
 
@@ -937,12 +958,12 @@ def _evaluate(
     predictions_torch = {}
 
     for part in parts:
+        # Generate batch indices on CPU for indexing CPU data tensors
+        # apply_model_impl will move the indexed batch to GPU
         y_pred_torch = torch.cat(
             [
                 apply_model(model, dataset, part=part, batch_idx=batch_idx)
-                for batch_idx in torch.arange(dataset.size(part), device=device).split(
-                    batch_size
-                )
+                for batch_idx in torch.arange(dataset.size(part)).split(batch_size)
             ],
             dim=BATCH_DIM,
         )
@@ -1333,6 +1354,7 @@ class Config(TypedDict):
     # Efficiency
     amp_dtype: NotRequired[AMPDType]
     timeout: NotRequired[int]
+    data_on_cpu: NotRequired[bool]  # Keep data on CPU, move batches to GPU during training
 
     # Report
     track_experiments: NotRequired[bool]
@@ -1542,22 +1564,31 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 print(f'Formed {len(eval_pairs[part][0])} {part} pairs')
     
     regression_label_stats = dataset.try_standardize_labels_()
-    print('Moving data to GPU...')
-    dataset = dataset.to_torch(device)
-    # Free numpy arrays that were replaced by torch tensors on GPU.
-    _free_mps_memory()
-    print('Data on GPU, freed numpy arrays')
     
-    # Convert pair indices to GPU tensors
+    # >>> Data loading mode
+    data_on_cpu = config.get('data_on_cpu', False)
+    if data_on_cpu:
+        print('Converting data to torch tensors on CPU (with pin_memory)...')
+        dataset = dataset.to_torch('cpu', pin_memory=True)
+        _free_mps_memory()
+        print('Data on CPU with pinned memory, batches will be moved to GPU during training')
+    else:
+        print('Moving data to GPU...')
+        dataset = dataset.to_torch(device)
+        _free_mps_memory()
+        print('Data on GPU, freed numpy arrays')
+    
+    # Convert pair indices to tensors (on CPU if data_on_cpu, else on GPU)
     if use_pairwise:
-        train_pair_pos_t = torch.tensor(train_pair_pos, device=device, dtype=torch.long)
-        train_pair_neg_t = torch.tensor(train_pair_neg, device=device, dtype=torch.long)
+        pair_device = 'cpu' if data_on_cpu else device
+        train_pair_pos_t = torch.tensor(train_pair_pos, device=pair_device, dtype=torch.long)
+        train_pair_neg_t = torch.tensor(train_pair_neg, device=pair_device, dtype=torch.long)
         eval_pairs_t = {
             'train': (train_pair_pos_t, train_pair_neg_t),
             **{
                 part: (
-                    torch.tensor(pos, device=device, dtype=torch.long),
-                    torch.tensor(neg, device=device, dtype=torch.long),
+                    torch.tensor(pos, device=pair_device, dtype=torch.long),
+                    torch.tensor(neg, device=pair_device, dtype=torch.long),
                 )
                 for part, (pos, neg) in eval_pairs.items()
             }
@@ -1835,9 +1866,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 pred_neg = all_preds[:, bs:]
                 losses = loss_fn(pred_pos, pred_neg)
             else:
+                y_batch = Y_train[batch_idx]
+                # Move labels to GPU if data is on CPU
+                if data_on_cpu and y_batch.device != device:
+                    y_batch = y_batch.to(device, non_blocking=True)
                 losses = loss_fn(
                     apply_model(model, dataset, part='train', batch_idx=batch_idx),
-                    Y_train[batch_idx],
+                    y_batch,
                 )
             # The scale of the gradients should not depend on the number of models,
             # so the individual losses are summed, not averaged.
