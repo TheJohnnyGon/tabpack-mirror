@@ -210,7 +210,7 @@ def finish(exp: str | Path, report: Report) -> None:
     _stop_running(exp)
 
     print()
-    print(util.add_frame(load_summary(exp)))
+    print(load_summary(exp))
     backup(exp)
 
 
