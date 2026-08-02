@@ -487,8 +487,8 @@ def main() -> None:
     x_num.flush()
     if x_cat is not None:
         x_cat.flush()
-    ys.flush()
-    keys.flush()
+    # NOTE: ys and keys are regular numpy arrays (np.empty), not memmap files,
+    # so they don't have flush() method.
     
     offsets = {}
     if args.parallel_files and len(splits) > 1:
