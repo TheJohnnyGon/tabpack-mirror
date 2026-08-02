@@ -366,6 +366,63 @@ def load_raw(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols):
     return row - row0
 
 
+# ── parallel file processing ─────────────────────────────────────────────────
+def _process_file_worker(
+    name: str,
+    path: Path,
+    row0: int,
+    expected_rows: int,
+    layout: str,
+    x_num_path: Path,
+    x_num_shape: tuple,
+    x_cat_path: Path | None,
+    x_cat_shape: tuple | None,
+    ys_path: Path,
+    ys_shape: tuple,
+    keys_path: Path,
+    keys_shape: tuple,
+    num_cols: np.ndarray,
+    cat_cols: np.ndarray,
+    n_features: int,
+    n_workers: int,
+    use_streaming: bool,
+) -> tuple[str, int, int]:
+    """Worker function for parallel file processing.
+    
+    Opens memmap files in each process and processes the file.
+    Returns (name, row0, n_rows).
+    """
+    # Re-open memmap files in this process
+    x_num = np.lib.format.open_memmap(x_num_path, mode="r+")
+    x_cat = np.lib.format.open_memmap(x_cat_path, mode="r+") if x_cat_path else None
+    ys = np.lib.format.open_memmap(ys_path, mode="r+")
+    keys = np.lib.format.open_memmap(keys_path, mode="r+")
+    
+    print(f"Loading {name} ({expected_rows:,} rows)...")
+    
+    if layout == "clean":
+        n = load_clean_polars(
+            path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols,
+            n_features, n_workers=n_workers, use_streaming=use_streaming,
+        )
+    else:
+        n = load_raw(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols)
+    
+    if n != expected_rows:
+        sys.exit(f"error: {path}: parsed {n} rows, counted {expected_rows}")
+    
+    print(f"  {name}: rows [{row0}, {row0 + n})")
+    
+    # Flush changes to disk
+    x_num.flush()
+    if x_cat is not None:
+        x_cat.flush()
+    ys.flush()
+    keys.flush()
+    
+    return name, row0, n
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
     args = parse_args()
@@ -426,21 +483,13 @@ def main() -> None:
     keys = np.empty(n_total, dtype=np.int64)  # Changed to int64 for polars hash
 
     # ── convert ──────────────────────────────────────────────────────────────
-    def process_file(name: str, path: Path, row0: int) -> tuple[str, int, int]:
-        """Process a single file. Returns (name, row0, n_rows)."""
-        print(f"Loading {name} ({counts[name]:,} rows)...")
-        loader = load_clean_polars if layouts[name] == "clean" else load_raw
-        if layouts[name] == "clean":
-            n = loader(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols,
-                       n_features, n_workers=args.n_workers or 1,
-                       use_streaming=args.streaming)
-        else:
-            n = loader(path, row0, x_num, x_cat, ys, keys, num_cols, cat_cols)
-        if n != counts[name]:
-            sys.exit(f"error: {path}: parsed {n} rows, counted {counts[name]}")
-        print(f"  {name}: rows [{row0}, {row0 + n})")
-        return name, row0, n
-
+    # Flush memmap files before processing
+    x_num.flush()
+    if x_cat is not None:
+        x_cat.flush()
+    ys.flush()
+    keys.flush()
+    
     offsets = {}
     if args.parallel_files and len(splits) > 1:
         # Parallel processing of files
@@ -451,20 +500,68 @@ def main() -> None:
             row_offsets[name] = row
             row += counts[name]
         
+        # Prepare paths for memmap files
+        x_num_path = args.out_dir / "x_num.npy"
+        x_cat_path = args.out_dir / "x_cat.npy" if x_cat is not None else None
+        ys_path = args.out_dir / "ys.npy"
+        keys_path = args.out_dir / "keys.npy"
+        
+        # Save temporary memmap files for ys and keys
+        np.save(ys_path, ys)
+        np.save(keys_path, keys)
+        
         with ProcessPoolExecutor(max_workers=min(len(splits), os.cpu_count() or 1)) as executor:
             futures = {
-                executor.submit(process_file, name, path, row_offsets[name]): name
+                executor.submit(
+                    _process_file_worker,
+                    name=name,
+                    path=path,
+                    row0=row_offsets[name],
+                    expected_rows=counts[name],
+                    layout=layouts[name],
+                    x_num_path=x_num_path,
+                    x_num_shape=x_num.shape,
+                    x_cat_path=x_cat_path,
+                    x_cat_shape=x_cat.shape if x_cat is not None else None,
+                    ys_path=ys_path,
+                    ys_shape=ys.shape,
+                    keys_path=keys_path,
+                    keys_shape=keys.shape,
+                    num_cols=num_cols,
+                    cat_cols=cat_cols,
+                    n_features=n_features,
+                    n_workers=args.n_workers or 1,
+                    use_streaming=args.streaming,
+                ): name
                 for name, path in splits
             }
             for future in tqdm(as_completed(futures), total=len(futures), desc="Files"):
                 name, row0, n = future.result()
                 offsets[name] = (row0, row0 + n)
+        
+        # Reload ys and keys from disk
+        ys = np.load(ys_path)
+        keys = np.load(keys_path)
+        
+        # Clean up temporary files
+        ys_path.unlink()
+        keys_path.unlink()
     else:
         # Sequential processing (default)
         row = 0
         for name, path in tqdm(splits, desc="Files"):
-            name, row0, n = process_file(name, path, row)
-            offsets[name] = (row0, row0 + n)
+            print(f"Loading {name} ({counts[name]:,} rows)...")
+            loader = load_clean_polars if layouts[name] == "clean" else load_raw
+            if layouts[name] == "clean":
+                n = loader(path, row, x_num, x_cat, ys, keys, num_cols, cat_cols,
+                           n_features, n_workers=args.n_workers or 1,
+                           use_streaming=args.streaming)
+            else:
+                n = loader(path, row, x_num, x_cat, ys, keys, num_cols, cat_cols)
+            if n != counts[name]:
+                sys.exit(f"error: {path}: parsed {n} rows, counted {counts[name]}")
+            print(f"  {name}: rows [{row}, {row + n})")
+            offsets[name] = (row, row + n)
             row += n
     
     x_num.flush()
