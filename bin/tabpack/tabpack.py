@@ -805,7 +805,7 @@ def update_online_ensembles(
     task: lib.data.Task,
     step: int,
     timer: delu.tools.Timer,
-    use_pair_logit: bool = False,
+    use_pairwise: bool = False,
     eval_pairs_t: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     **kwargs,
 ) -> tuple[dict[str, lib.experiment.Report], bool]:
@@ -826,12 +826,10 @@ def update_online_ensembles(
                 )
                 for k, v in ensemble._predictions.items()
             }
-            metrics = task.calculate_metrics(
-                ensemble_predictions, ensemble._prediction_type
-            )
-
-            # Add pair accuracy for pair logit models
-            if use_pair_logit and eval_pairs_t is not None:
+            
+            # For pairwise tasks, compute only pair_accuracy
+            if use_pairwise and eval_pairs_t is not None:
+                metrics = {}
                 for part, (pos_idx, neg_idx) in eval_pairs_t.items():
                     if part in ensemble_predictions:
                         pred = ensemble_predictions[part]
@@ -841,8 +839,12 @@ def update_online_ensembles(
                         pred_pos = pred[pos_idx_np]
                         pred_neg = pred[neg_idx_np]
                         pair_acc = float((pred_pos > pred_neg).mean())
-                        metrics[part]['pair_accuracy'] = pair_acc
-                        metrics[part]['score'] = pair_acc
+                        metrics[part] = {'pair_accuracy': pair_acc, 'score': pair_acc}
+            else:
+                # For standard tasks, use calculate_metrics
+                metrics = task.calculate_metrics(
+                    ensemble_predictions, ensemble._prediction_type
+                )
 
             reports[ensemble_name] = {
                 'ids': ensemble.ids.tolist(),
@@ -924,7 +926,7 @@ def _evaluate(
     prediction_type: str | PredictionType,
     batch_size: int,
     device: torch.device,
-    use_pair_logit: bool = False,
+    use_pairwise: bool = False,
     eval_pairs_t: None | dict[PartKey, tuple[Tensor, Tensor]] = None,
 ) -> _EvaluateOutput:
     model.eval()
@@ -945,8 +947,8 @@ def _evaluate(
             dim=BATCH_DIM,
         )
 
-        if use_pair_logit:
-            # Raw logits — no transformation needed for pair logit
+        if use_pairwise:
+            # Raw logits — no transformation needed for pairwise
             y_pred = y_pred_torch.cpu().numpy()
             
             assert eval_pairs_t is not None
@@ -1021,19 +1023,19 @@ def _make_online_ensembles(
     prediction_type: PredictionType,
     update_part: PartKey,
     device: torch.device,
-    use_pair_logit: bool = False,
+    use_pairwise: bool = False,
     eval_pairs_t: dict[PartKey, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> dict[str, OnlineEnsemble]:
-    if use_pair_logit:
-        # For pair_logit, use pair accuracy as score function
-        assert eval_pairs_t is not None, "eval_pairs_t required for pair_logit"
+    if use_pairwise:
+        # For pairwise, use pair accuracy as score function
+        assert eval_pairs_t is not None, "eval_pairs_t required for pairwise"
         pair_pos_indices, pair_neg_indices = eval_pairs_t[update_part]
         score_fn = bin.tabpack.ensemble_utils_torch.make_pair_accuracy_score_fn(
             pair_pos_indices,
             pair_neg_indices,
             device=device,
         )
-        loss_score_fn = None  # Not applicable for pair_logit
+        loss_score_fn = None  # Not applicable for pairwise
     else:
         score_fn = bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
             task,
@@ -1179,24 +1181,57 @@ def form_pairs(
     return pos_indices, neg_indices
 
 
-def _make_pair_logit_loss_fn_pack() -> Callable[[Tensor, Tensor], Tensor]:
-    """Create a pair logit loss function for pack training.
+def _make_bce_pairwise_loss_fn_pack() -> Callable[[Tensor, Tensor], Tensor]:
+    """BCE pairwise loss (RankNet-style).
     
-    The loss encourages pred_pos > pred_neg for each pair.
-    Uses BCEWithLogits on (pred_pos - pred_neg) with target=1.
-    
-    Returns:
-        Loss function that takes (pred_pos, pred_neg) and returns (pack_size,) tensor.
+    Encourages pred_pos > pred_neg via BCEWithLogits on (pred_pos - pred_neg).
     """
     def loss_fn_pack(pred_pos: Tensor, pred_neg: Tensor) -> Tensor:
-        # pred_pos, pred_neg: (pack_size, batch_size)
         diff = pred_pos - pred_neg
         losses = nn.functional.binary_cross_entropy_with_logits(
             diff, torch.ones_like(diff), reduction='none'
         )
-        return losses.mean(dim=BATCH_DIM)  # (pack_size,)
+        return losses.mean(dim=BATCH_DIM)
     
     return loss_fn_pack
+
+
+def _make_margin_ranknet_loss_fn_pack(margin: float = 1.0) -> Callable[[Tensor, Tensor], Tensor]:
+    """Margin RankNet pairwise loss.
+    
+    Encourages pred_pos - pred_neg > margin via hinge loss.
+    """
+    def loss_fn_pack(pred_pos: Tensor, pred_neg: Tensor) -> Tensor:
+        diff = pred_pos - pred_neg
+        losses = torch.clamp(margin - diff, min=0.0)
+        return losses.mean(dim=BATCH_DIM)
+    
+    return loss_fn_pack
+
+
+def _make_pairwise_loss_fn_pack(pairwise_config: KWArgs | None = None) -> Callable[[Tensor, Tensor], Tensor]:
+    """Create a pairwise loss function for pack training.
+    
+    Args:
+        pairwise_config: Config dict with 'loss' key. Supported values:
+            - 'bce' (default): BCEWithLogits on (pred_pos - pred_neg)
+            - 'margin_ranknet': Hinge loss with margin on (pred_pos - pred_neg)
+    
+    Returns:
+        Loss function that takes (pred_pos, pred_neg) and returns (pack_size,) tensor.
+    """
+    if pairwise_config is None:
+        pairwise_config = {}
+    
+    loss_type = pairwise_config.get('loss', 'bce')
+    
+    if loss_type == 'bce':
+        return _make_bce_pairwise_loss_fn_pack()
+    elif loss_type == 'margin_ranknet':
+        margin = pairwise_config.get('margin', 1.0)
+        return _make_margin_ranknet_loss_fn_pack(margin=margin)
+    else:
+        raise ValueError(f'Unknown pairwise loss type: {loss_type!r}. Supported: bce, margin_ranknet')
 
 
 def _get_mean_scores(
@@ -1280,7 +1315,9 @@ class Config(TypedDict):
     batch_size: int
     n_epochs: int
     patience: int
-    loss: NotRequired[str]  # 'default' or 'pair_logit'
+
+    # Pairwise (only for task.type == 'pairwise')
+    pairwise: NotRequired[KWArgs]  # e.g. {'loss': 'bce'} or {'loss': 'margin_ranknet', 'margin': 1.0}
 
     # Evaluation
     eval_parts: NotRequired[list[PartKey]]
@@ -1480,12 +1517,12 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     assert dataset.n_bin_features == 0
     print(f'Dataset loaded: {dataset.size("train")} train, {dataset.size("val")} val, {dataset.size("test")} test')
     
-    # >>> Pair logit setup
-    use_pair_logit = config.get('loss') == 'pair_logit'
+    # >>> Pairwise setup
+    use_pairwise = dataset.task.is_pairwise
     eval_parts = config.get('eval_parts', ['val', 'test'])
     
-    if use_pair_logit:
-        assert 'key' in dataset.data, "key.npy is required for pair_logit loss"
+    if use_pairwise:
+        assert 'key' in dataset.data, "key.npy is required for pairwise task"
         
         # Form pairs for train
         train_pair_pos, train_pair_neg = form_pairs(
@@ -1512,7 +1549,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     print('Data on GPU, freed numpy arrays')
     
     # Convert pair indices to GPU tensors
-    if use_pair_logit:
+    if use_pairwise:
         train_pair_pos_t = torch.tensor(train_pair_pos, device=device, dtype=torch.long)
         train_pair_neg_t = torch.tensor(train_pair_neg, device=device, dtype=torch.long)
         eval_pairs_t = {
@@ -1583,8 +1620,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # NOTE
     # Predictions must be stored in aggregation-friendly units
     # for ensembling purposes (raw logits do _not_ meet this requirement).
-    # For pair logit, we use LOGITS since we want raw scores for ranking.
-    if use_pair_logit:
+    # For pairwise, we use LOGITS since we want raw scores for ranking.
+    if use_pairwise:
         prediction_type = PredictionType.LOGITS
     else:
         prediction_type = (
@@ -1604,8 +1641,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             prediction_type=prediction_type,
             update_part='val',
             device=device,
-            use_pair_logit=use_pair_logit,
-            eval_pairs_t=eval_pairs_t if use_pair_logit else None,
+            use_pairwise=use_pairwise,
+            eval_pairs_t=eval_pairs_t if use_pairwise else None,
         )
         online_ensemble_history = {}
     logger.debug('Created the ensembles')
@@ -1645,8 +1682,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     del configs_T
 
-    if use_pair_logit:
-        loss_fn = _make_pair_logit_loss_fn_pack()
+    if use_pairwise:
+        loss_fn = _make_pairwise_loss_fn_pack(config.get('pairwise'))
         n_train_pairs = len(train_pair_pos)
         epoch_size = math.ceil(n_train_pairs / config['batch_size'])
     else:
@@ -1666,8 +1703,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             regression_label_stats=regression_label_stats,
             prediction_type=prediction_type,
             device=device,
-            use_pair_logit=use_pair_logit,
-            eval_pairs_t=eval_pairs_t if use_pair_logit else None,
+            use_pairwise=use_pairwise,
+            eval_pairs_t=eval_pairs_t if use_pairwise else None,
         )
     )
     logger.debug('Created the evaluation function')
@@ -1766,7 +1803,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         epoch_training_start_time = time.perf_counter()
         model.train()
 
-        if use_pair_logit:
+        if use_pairwise:
             batches = generate_pair_training_batches(
                 n_pairs=n_train_pairs,
                 batch_size=config['batch_size'],
@@ -1788,7 +1825,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             leave=False,
             disable=not lib.env.is_local(),
         ):
-            if use_pair_logit:
+            if use_pairwise:
                 pos_idx = train_pair_pos_t[batch_idx]  # (pack_size, batch_size)
                 neg_idx = train_pair_neg_t[batch_idx]  # (pack_size, batch_size)
                 all_idx = torch.cat([pos_idx, neg_idx], dim=BATCH_DIM)  # (pack_size, 2*batch_size)
@@ -1850,7 +1887,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         )
         
         # Update pair accuracy scores for logging
-        if use_pair_logit:
+        if use_pairwise:
             pair_accuracy_scores = {
                 part: float(np.mean(metrics['pair_accuracy']))
                 for part, metrics in eval_metrics.items()
@@ -1993,7 +2030,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 task=dataset.task,
                 step=step,
                 timer=timer,
-                use_pair_logit=use_pair_logit,
+                use_pairwise=use_pairwise,
                 eval_pairs_t=eval_pairs_t,
                 running_ids=state.ids,
                 running_steps=state.steps,
@@ -2020,7 +2057,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 del ensemble_name, ensemble_report
 
             # Save pair_accuracy from ensemble to report for summary.txt
-            if use_pair_logit and ensemble_reports:
+            if use_pairwise and ensemble_reports:
                 first_ensemble_report = next(iter(ensemble_reports.values()))
                 report['pair_accuracy'] = {
                     part: metrics.get('pair_accuracy', 0.0)
@@ -2114,7 +2151,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             first_online_ensemble_scores = {
                 part: (
                     part_metrics.get('pair_accuracy', part_metrics['score'])
-                    if use_pair_logit
+                    if use_pairwise
                     else part_metrics['score']
                 )
                 for part, part_metrics in (
@@ -2144,7 +2181,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 f'[{part[0]}*] {score:.3f}' for part, score in best_scores.items()
             )
         )
-        ensemble_suffix = '@' if use_pair_logit else '$'
+        ensemble_suffix = '@' if use_pairwise else '$'
         first_online_ensemble_scores_message = (
             None
             if first_online_ensemble_scores is None or not first_online_ensemble_scores
@@ -2155,8 +2192,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         )
         pair_accuracy_message = (
             None
-            # For pair_logit, pair accuracy is shown in ensemble output, skip [v@]
-            if pair_accuracy_scores is None or use_pair_logit
+            # For pairwise, pair accuracy is shown in ensemble output, skip [v@]
+            if pair_accuracy_scores is None or use_pairwise
             else ' '.join(
                 f'[{part[0]}@] {score:.3f}'
                 for part, score in pair_accuracy_scores.items()
@@ -2333,6 +2370,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 'data_config': data_config_to_save,
                 'ensemble': ensemble_info,
                 'preprocessor': preprocessor,
+                'use_pairwise': use_pairwise,
             },
             exp / 'model.pt',
         )

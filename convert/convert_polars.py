@@ -72,6 +72,7 @@ TASK_SCORES = {
     "binclass": "accuracy",
     "multiclass": "accuracy",
     "regression": "rmse",
+    "pairwise": "pair_accuracy",
 }
 
 NA_STRINGS = {"", "nan", "null", "none", "\\n", "NaN", "NULL"}
@@ -92,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ignored-features", default=None,
                    help='Spec string "11:21-23:26" or path to a file with it '
                         "(0-based FEATURE indices, ranges inclusive, clipped)")
-    p.add_argument("--task-type", choices=sorted(TASK_SCORES), default="binclass")
+    p.add_argument("--task-type", choices=sorted(TASK_SCORES), default="pairwise")
     p.add_argument("--n-workers", type=int, default=os.cpu_count(),
                    help="Number of workers for polars (default: all CPUs)")
     args = p.parse_args()

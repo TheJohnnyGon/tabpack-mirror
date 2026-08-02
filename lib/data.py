@@ -813,6 +813,7 @@ class Score(enum.Enum):
     R2 = 'r2'
     RMSE = 'rmse'
     ROC_AUC = 'roc-auc'
+    PAIR_ACCURACY = 'pair_accuracy'
 
 
 _SCORE_HIGHER_IS_BETTER = {
@@ -822,6 +823,7 @@ _SCORE_HIGHER_IS_BETTER = {
     Score.R2: True,
     Score.RMSE: False,
     Score.ROC_AUC: True,
+    Score.PAIR_ACCURACY: True,
 }
 
 
@@ -864,6 +866,10 @@ class Task:
         return self.type_ == TaskType.MULTICLASS
 
     @property
+    def is_pairwise(self) -> bool:
+        return self.type_ == TaskType.PAIRWISE
+
+    @property
     def is_classification(self) -> bool:
         return self.is_binclass or self.is_multiclass
 
@@ -872,7 +878,7 @@ class Task:
         return len(np.unique(np.concatenate(list(self.labels.values()))))
 
     def try_compute_n_classes(self) -> None | int:
-        return None if self.is_regression else self.compute_n_classes()
+        return None if self.is_regression or self.is_pairwise else self.compute_n_classes()
 
     def calculate_metrics(
         self,

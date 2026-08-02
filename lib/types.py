@@ -13,6 +13,7 @@ class TaskType(enum.Enum):
     REGRESSION = 'regression'
     BINCLASS = 'binclass'
     MULTICLASS = 'multiclass'
+    PAIRWISE = 'pairwise'
 
 
 class PredictionType(enum.Enum):
