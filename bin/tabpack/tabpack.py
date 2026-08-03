@@ -1520,6 +1520,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # >>> Pairwise setup
     use_pairwise = dataset.task.is_pairwise
     eval_parts = config.get('eval_parts', ['val', 'test'])
+    eval_pairs_t = None  # Initialize to None for non-pairwise tasks
     
     if use_pairwise:
         assert 'key' in dataset.data, "key.npy is required for pairwise task"
