@@ -124,10 +124,12 @@ def load_tsv(
     _t0 = time.perf_counter()
     
     while True:
-        batch = reader.next_batches(BATCH_SIZE)
-        if batch is None:
+        batches = reader.next_batches(BATCH_SIZE)
+        if batches is None:
             break
         
+        # Concatenate all batches into one DataFrame
+        batch = pl.concat(batches)
         n = len(batch)
         sl = slice(row, row + n)
         
