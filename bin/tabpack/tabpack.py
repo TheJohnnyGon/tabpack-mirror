@@ -144,6 +144,89 @@ class ModelPack(bin.tabpack.nn.ModulePack):
         return x
 
 
+class PinnedBatchStager:
+    """Reusable pinned CPU staging buffers for fast async H2D of batch features.
+
+    Motivation (data_on_cpu=True):
+    Advanced indexing (``src[batch_idx]``) allocates a *fresh, pageable* CPU
+    tensor every step. Copying a pageable tensor to the GPU is always
+    synchronous, so ``.to(device, non_blocking=True)`` silently degrades into a
+    blocking copy and the GPU stalls waiting for the transfer.
+
+    Instead we gather into a *pre-allocated pinned* buffer via
+    ``torch.index_select(src, 0, idx, out=buf)`` and copy ``buf[:n]`` to the
+    device with ``non_blocking=True``. Because the source is pinned, the copy is
+    truly asynchronous and can overlap with compute.
+
+    A small ring of buffers (+ CUDA events on CUDA) is used so the CPU does not
+    overwrite a buffer whose async copy is still in flight. This is *not* the
+    prefetch pipeline of Variant 2 (no dedicated stream, no double buffering of
+    whole batches ahead) — it only guarantees correctness of buffer reuse.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        max_rows: int,
+        specs: dict[str, tuple[int, torch.dtype]],
+        ring_size: int = 2,
+    ) -> None:
+        # specs: key -> (n_features, dtype) of the source (train) feature tensor.
+        self._device = device
+        self._max_rows = max_rows
+        self._ring_size = ring_size
+        self._is_cuda = device.type == 'cuda'
+        self._pos = 0
+        # Pre-allocate `ring_size` pinned buffers per feature key.
+        self._buffers: dict[str, list[Tensor]] = {}
+        for key, (n_features, dtype) in specs.items():
+            self._buffers[key] = [
+                torch.empty(
+                    (max_rows, n_features),
+                    dtype=dtype,
+                    pin_memory=self._is_cuda,
+                )
+                for _ in range(ring_size)
+            ]
+        # One event per ring slot, tracking the last H2D copy that read it.
+        self._events: list[None | torch.cuda.Event] = (
+            [torch.cuda.Event() for _ in range(ring_size)]
+            if self._is_cuda
+            else [None] * ring_size
+        )
+        self._slot_recorded = [False] * ring_size
+
+    def _next_slot(self) -> int:
+        slot = self._pos
+        self._pos = (self._pos + 1) % self._ring_size
+        # Make sure the previous async copy out of this slot has finished
+        # before we overwrite the pinned buffer.
+        if self._is_cuda and self._slot_recorded[slot]:
+            self._events[slot].synchronize()  # type: ignore[union-attr]
+        return slot
+
+    def gather(self, key: str, src: Tensor, flat_idx: Tensor) -> Tensor:
+        """Gather rows ``src[flat_idx]`` into a pinned buffer and move to device.
+
+        ``flat_idx`` must be a 1-D CPU LongTensor. Returns a 2-D device tensor
+        of shape ``(len(flat_idx), n_features)``.
+        """
+        slot = self._next_slot()
+        buf = self._buffers[key][slot]
+        n = flat_idx.shape[0]
+        assert n <= self._max_rows, (
+            f'batch of {n} rows exceeds staging buffer capacity {self._max_rows}'
+        )
+        out = buf[:n]
+        torch.index_select(src, 0, flat_idx, out=out)
+        result = out.to(self._device, non_blocking=self._is_cuda)
+        if self._is_cuda:
+            self._events[slot].record()  # type: ignore[union-attr]
+            self._slot_recorded[slot] = True
+        return result
+
+
 class ApplyModel(Protocol):
     def __call__(
         self,
@@ -152,27 +235,50 @@ class ApplyModel(Protocol):
         *,
         part: PartKey,
         batch_idx: Tensor,
+        stager: None | PinnedBatchStager = ...,
     ) -> Tensor: ...
 
 
 def apply_model_impl(
-    model: nn.Module, dataset: lib.data.Dataset, *, part: PartKey, batch_idx: Tensor
+    model: nn.Module,
+    dataset: lib.data.Dataset,
+    *,
+    part: PartKey,
+    batch_idx: Tensor,
+    stager: None | PinnedBatchStager = None,
 ) -> Tensor:
     # Get the device from model parameters
     device = next(model.parameters()).device
-    
-    # Index data (works for both CPU and GPU tensors)
-    # If data is on CPU and batch_idx is on CPU, result is on CPU
-    # Then we move the result to the model's device
-    x_num = dataset.data['x_num'][part][batch_idx] if 'x_num' in dataset.data else None
-    x_cat = dataset.data['x_cat'][part][batch_idx] if 'x_cat' in dataset.data else None
-    
-    # Move indexed batches to model device if needed
-    if x_num is not None and x_num.device != device:
-        x_num = x_num.to(device, non_blocking=True)
-    if x_cat is not None and x_cat.device != device:
-        x_cat = x_cat.to(device, non_blocking=True)
-    
+
+    x_num_src = dataset.data['x_num'][part] if 'x_num' in dataset.data else None
+    x_cat_src = dataset.data['x_cat'][part] if 'x_cat' in dataset.data else None
+
+    def prepare(key: str, src: None | Tensor) -> None | Tensor:
+        if src is None:
+            return None
+        # Fast path: data already lives on the model device (data_on_cpu=False).
+        # Advanced indexing keeps everything on-device; nothing to transfer.
+        if src.device == device:
+            return src[batch_idx]
+        # data_on_cpu=True: src is a pinned CPU tensor.
+        # `batch_idx` may be on the GPU (e.g. pairwise pos/neg indices computed
+        # from GPU pair tensors). index_select requires the index on the same
+        # device as `src`, so bring the (small) index tensor back to CPU.
+        idx_cpu = batch_idx if batch_idx.device.type == 'cpu' else batch_idx.cpu()
+        if stager is not None:
+            # Staged async H2D via pinned buffer. `index_select` needs a 1-D
+            # index, so flatten (pack, batch) -> (pack*batch) and restore shape.
+            flat_idx = idx_cpu.reshape(-1)
+            gathered = stager.gather(key, src, flat_idx)
+            return gathered.reshape(*idx_cpu.shape, src.shape[-1])
+        # Fallback (e.g. evaluation): gather on CPU then async copy. Without a
+        # pinned staging buffer the copy is effectively synchronous, but eval is
+        # far less latency-sensitive than the training loop.
+        return src[idx_cpu].to(device, non_blocking=True)
+
+    x_num = prepare('x_num', x_num_src)
+    x_cat = prepare('x_cat', x_cat_src)
+
     return (
         model(x_num, x_cat)
         .squeeze(-1)  # Remove the last dimension for regression predictions.
@@ -1578,9 +1684,14 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         _free_mps_memory()
         print('Data on GPU, freed numpy arrays')
     
-    # Convert pair indices to tensors (on CPU if data_on_cpu, else on GPU)
+    # Convert pair indices to tensors.
+    # These are small int tensors, so we always keep them on the GPU (Variant 4),
+    # even when data_on_cpu=True. Indexing them with a CPU `batch_idx` is fine
+    # (PyTorch allows a CPU index on a CUDA tensor); the resulting pos/neg index
+    # tensors live on the GPU and are cheaply moved back to CPU inside
+    # `apply_model_impl` only for the CPU feature gather.
     if use_pairwise:
-        pair_device = 'cpu' if data_on_cpu else device
+        pair_device = device
         train_pair_pos_t = torch.tensor(train_pair_pos, device=pair_device, dtype=torch.long)
         train_pair_neg_t = torch.tensor(train_pair_neg, device=pair_device, dtype=torch.long)
         eval_pairs_t = {
@@ -1595,7 +1706,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         }
     
     n_classes = dataset.task.try_compute_n_classes()
-    Y_train = _make_Y_train(dataset)
+    # Variant 4: keep the (small) training labels on the GPU even when
+    # data_on_cpu=True, so the per-step label transfer disappears from the loop.
+    Y_train = _make_Y_train(dataset).to(device)
     train_size = dataset.size('train')
 
     # >>> Hyperparameter sampler
@@ -1659,6 +1772,33 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             PredictionType.LABELS if dataset.task.is_regression else PredictionType.PROBS
         )
     apply_model = apply_model_impl if autocast is None else autocast(apply_model_impl)
+
+    # >>> Pinned staging buffer for async H2D during training (Variant 1)
+    # Only needed when data lives on CPU. `apply_model_impl` uses it to gather
+    # each batch into a pre-allocated pinned buffer via `index_select` so that
+    # the subsequent `.to(device, non_blocking=True)` is a genuine async copy.
+    train_stager: None | PinnedBatchStager = None
+    if data_on_cpu:
+        # A training batch has `pack_size` independently shuffled rows of size
+        # `batch_size`; for pairwise we gather pos+neg together => 2x rows.
+        max_rows = state.pack_size * config['batch_size'] * (2 if use_pairwise else 1)
+        feature_specs: dict[str, tuple[int, torch.dtype]] = {}
+        for key in ('x_num', 'x_cat'):
+            if key in dataset.data:
+                src = dataset.data[key]['train']
+                feature_specs[key] = (src.shape[-1], src.dtype)
+        if feature_specs:
+            train_stager = PinnedBatchStager(
+                device=device,
+                max_rows=max_rows,
+                specs=feature_specs,
+            )
+            logger.debug('Created the pinned batch stager')
+    apply_model_train = (
+        apply_model
+        if train_stager is None
+        else partial(apply_model, stager=train_stager)
+    )
 
     # >>> Ensembles
     online_ensemble_configs = config.get('online_ensembles')
@@ -1857,21 +1997,25 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             disable=not lib.env.is_local(),
         ):
             if use_pairwise:
+                # `train_pair_*_t` live on the GPU (Variant 4); indexing them
+                # with the CPU `batch_idx` yields GPU index tensors. The staged
+                # gather inside `apply_model_impl` moves them back to CPU only
+                # for the CPU feature `index_select`.
                 pos_idx = train_pair_pos_t[batch_idx]  # (pack_size, batch_size)
                 neg_idx = train_pair_neg_t[batch_idx]  # (pack_size, batch_size)
                 all_idx = torch.cat([pos_idx, neg_idx], dim=BATCH_DIM)  # (pack_size, 2*batch_size)
-                all_preds = apply_model(model, dataset, part='train', batch_idx=all_idx)
+                all_preds = apply_model_train(model, dataset, part='train', batch_idx=all_idx)
                 bs = batch_idx.shape[BATCH_DIM]
                 pred_pos = all_preds[:, :bs]
                 pred_neg = all_preds[:, bs:]
                 losses = loss_fn(pred_pos, pred_neg)
             else:
+                # `Y_train` lives on the GPU (Variant 4). Indexing it with the
+                # CPU `batch_idx` produces the label batch directly on the GPU,
+                # so no per-step label transfer is needed.
                 y_batch = Y_train[batch_idx]
-                # Move labels to GPU if data is on CPU
-                if data_on_cpu and y_batch.device != device:
-                    y_batch = y_batch.to(device, non_blocking=True)
                 losses = loss_fn(
-                    apply_model(model, dataset, part='train', batch_idx=batch_idx),
+                    apply_model_train(model, dataset, part='train', batch_idx=batch_idx),
                     y_batch,
                 )
             # The scale of the gradients should not depend on the number of models,
