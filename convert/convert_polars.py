@@ -12,6 +12,9 @@ Output (--out-dir):
     x_num.npy                  float32 (N, n_features)
     y.npy                      int64 (binclass/multiclass) | float32 (regression)
     key.npy                    int64  (N,)  — polars hash of the group key
+    original_keys.tsv          str    (N,)  — original (un-hashed) group key,
+                               one per line, in the SAME row order as x_num.npy
+                               (row i of original_keys.tsv ↔ row i of x_num.npy)
     info.json                  {"task": {"type": ..., "score": ...}}
     splits/default/train.npy   int32  (contiguous ranges, original row order
     splits/default/val.npy      is preserved → groups stay contiguous,
@@ -85,6 +88,7 @@ def load_tsv(
     x_num: np.memmap,
     ys: np.ndarray,
     keys: np.ndarray,
+    orig_keys: np.ndarray,
     n_features: int,
     n_workers: int,
 ) -> int:
@@ -95,6 +99,9 @@ def load_tsv(
     - No redundant .astype() copies
     - Single pass (no count_rows pre-scan)
     - Direct memmap writes
+
+    Also fills `orig_keys` with the original (un-hashed) group key string for
+    each row, preserving the exact row order used for x_num / y / key.
     """
     # Column names: key, label, f_1, f_2, ..., f_K
     # Polars names headerless columns column_1, column_2, ... (1-based)
@@ -142,6 +149,9 @@ def load_tsv(
         
         # Keys: polars hash (uint64 → int64 view)
         keys[sl] = batch[key_col].hash().to_numpy().view(np.int64)
+
+        # Original (un-hashed) keys: keep as strings, same row order
+        orig_keys[sl] = batch[key_col].cast(pl.String).to_numpy()
         
         # Features: direct conversion (already Float32, no .astype() copy)
         x_num[sl, :] = batch.select(feat_cols).to_numpy()
@@ -202,13 +212,14 @@ def main() -> None:
     )
     ys = np.empty(n_total, dtype=np.float64)
     keys = np.empty(n_total, dtype=np.int64)
+    orig_keys = np.empty(n_total, dtype=object)  # original (un-hashed) keys
 
     # ── convert (sequential, with full intra-file parallelism) ───────────────
     offsets = {}
     row = 0
     for name, path in tqdm(splits, desc="Files"):
         print(f"Loading {name} ({counts[name]:,} rows)...")
-        n = load_tsv(path, row, x_num, ys, keys, n_features, args.n_workers)
+        n = load_tsv(path, row, x_num, ys, keys, orig_keys, n_features, args.n_workers)
         if n != counts[name]:
             sys.exit(f"error: {path}: parsed {n} rows, counted {counts[name]}")
         print(f"  {name}: rows [{row}, {row + n})")
@@ -223,6 +234,15 @@ def main() -> None:
     np.save(args.out_dir / "y.npy", y)
     np.save(args.out_dir / "key.npy", keys)
 
+    # Original (un-hashed) keys as TSV, one per line, same row order as x_num.npy.
+    # This lets downstream inference join RawFormulaVal predictions back to the
+    # original DocId/OID without needing to reverse the polars hash.
+    orig_keys_path = args.out_dir / "original_keys.tsv"
+    with orig_keys_path.open("w", encoding="utf-8") as f:
+        for k in orig_keys:
+            f.write("" if k is None else str(k))
+            f.write("\n")
+
     info = {"task": {"type": args.task_type, "score": TASK_SCORES[args.task_type]}}
     (args.out_dir / "info.json").write_text(json.dumps(info, indent=4) + "\n")
 
@@ -235,6 +255,7 @@ def main() -> None:
     print(f"  x_num.npy {x_num.shape} float32")
     print(f"  y.npy {y.shape} {y.dtype}")
     print(f"  key.npy {keys.shape} int64")
+    print(f"  original_keys.tsv ({n_total},) str")
     print(f"  info.json")
     print(f"  splits/default/{{{', '.join(n for n, _ in splits)}}}.npy")
     

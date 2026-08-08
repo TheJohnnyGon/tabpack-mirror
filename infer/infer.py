@@ -80,6 +80,78 @@ def load_model_artifact(path: str | Path) -> dict:
     return torch.load(path, map_location='cpu', weights_only=False)
 
 
+def load_original_keys_for_part(
+    dataset_dir: str | Path,
+    split_id,
+    part: str,
+) -> np.ndarray | None:
+    """Load original (un-hashed) keys and align them with a given part.
+
+    `original_keys.tsv` (produced by convert_polars.py) stores one key per line
+    in the SAME row order as x_num.npy / y.npy / key.npy (the full dataset before
+    the split is applied). To align these keys with the predictions of `part`,
+    we load the split indices for that part and index into the full key array.
+
+    Returns:
+        np.ndarray of dtype object (str keys) aligned 1:1 with the part rows,
+        or None if original_keys.tsv is not present.
+    """
+    dataset_dir = Path(dataset_dir)
+    keys_path = dataset_dir / 'original_keys.tsv'
+    if not keys_path.exists():
+        return None
+
+    # Full-order keys (strip only the trailing newline, keep the key verbatim).
+    with keys_path.open('r', encoding='utf-8') as f:
+        all_keys = np.array([line.rstrip('\n') for line in f], dtype=object)
+
+    # Split indices for the requested part (indices into the full array).
+    split = lib.data.load_split(dataset_dir, split_id)
+    if part not in split:
+        raise KeyError(
+            f'Part {part!r} not found in split {split_id!r}.'
+            f' Available parts: {sorted(split)}'
+        )
+    part_idx = split[part]
+    return all_keys[part_idx]
+
+
+def write_predictions_tsv(
+    output_path: str | Path,
+    original_keys: np.ndarray,
+    predictions: np.ndarray,
+) -> None:
+    """Write a TSV joining original keys with RawFormulaVal predictions.
+
+    The prediction column is concatenated along axis=1 with the original keys:
+        <original_key>\t<RawFormulaVal>
+
+    For multiclass predictions (2-D), each class score is written as its own
+    tab-separated column after the key.
+    """
+    output_path = Path(output_path)
+    preds = np.asarray(predictions)
+
+    if preds.ndim == 1:
+        preds = preds.reshape(-1, 1)
+
+    n_keys = len(original_keys)
+    n_preds = preds.shape[0]
+    if n_keys != n_preds:
+        raise ValueError(
+            f'Row count mismatch: {n_keys} original keys vs {n_preds} predictions.'
+            ' The dataset used for inference must match the one used to build'
+            ' original_keys.tsv.'
+        )
+
+    with output_path.open('w', encoding='utf-8') as f:
+        for key, row in zip(original_keys, preds):
+            values = '\t'.join(repr(float(v)) for v in row)
+            f.write(f'{key}\t{values}\n')
+
+    print(f'  wrote {n_keys} rows → {output_path}')
+
+
 def build_model_for_ensemble(
     artifact: dict,
     model_ids: list[int],
@@ -291,6 +363,25 @@ def main():
         action='store_true',
         help='Compare inference results with training metrics from summary.txt',
     )
+    parser.add_argument(
+        '--metrics',
+        action='store_true',
+        help=(
+            'For each object compute RawFormulaVal (raw prediction) and write a '
+            'TSV that joins the original keys (from original_keys.tsv) with the '
+            'prediction column, one file per evaluated part.'
+        ),
+    )
+    parser.add_argument(
+        '--metrics-output-dir',
+        type=str,
+        default=None,
+        help=(
+            'Directory for the RawFormulaVal TSV files produced by --metrics '
+            '(default: alongside model.pt). One file "<part>_raw_formula.tsv" '
+            'is written per part.'
+        ),
+    )
     args = parser.parse_args()
 
     # Setup device
@@ -373,14 +464,13 @@ def main():
 
     # Build dataset
     print(f'\nBuilding dataset...')
+    data_config = artifact['data_config']
+    dataset_dir = Path(data_config['path']).resolve()
+    split_id = data_config.get('split_id', lib.data.DEFAULT_SPLIT_ID)
     preprocessor = artifact.get('preprocessor')
     if preprocessor is not None:
         print('Using saved DataPreprocessor from model.pt')
-        data_config = artifact['data_config']
-        dataset = lib.data.Dataset.from_dir(
-            Path(data_config['path']).resolve(),
-            data_config.get('split_id', lib.data.DEFAULT_SPLIT_ID)
-        )
+        dataset = lib.data.Dataset.from_dir(dataset_dir, split_id)
         dataset = preprocessor.transform(dataset)
     else:
         # Fallback to original build_dataset
@@ -464,6 +554,30 @@ def main():
                     key_val = str(int(keys[p_idx]))[:17]
                     marker = '✓' if correct else '✗'
                     print(f'  {i+1:<5} {key_val:<18} {pred_pos:>9.4f} {pred_neg:>9.4f} {diff:>9.4f} {marker}')
+
+    # Write RawFormulaVal predictions joined with original keys, if requested
+    if args.metrics:
+        print('\n=== Writing RawFormulaVal TSV (--metrics) ===')
+        if args.metrics_output_dir is not None:
+            out_dir = Path(args.metrics_output_dir)
+        else:
+            out_dir = Path(args.model_path).resolve().parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for part in args.parts:
+            # RawFormulaVal = the (ensemble-averaged) per-object prediction.
+            preds = np.asarray(result['predictions'][part])
+
+            original_keys = load_original_keys_for_part(dataset_dir, split_id, part)
+            if original_keys is None:
+                print(
+                    f'  [{part}] SKIP: original_keys.tsv not found in {dataset_dir}.'
+                    ' Re-run convert_polars.py to generate it.'
+                )
+                continue
+
+            out_path = out_dir / f'{part}_raw_formula.tsv'
+            write_predictions_tsv(out_path, original_keys, preds)
 
     # Compare with Nirvana results if requested
     if args.compare_nirvana:
