@@ -340,6 +340,16 @@ def main():
         help='Path to model.pt',
     )
     parser.add_argument(
+        '--data-path',
+        type=str,
+        default=None,
+        help=(
+            'Override the dataset directory. By default the path stored in the '
+            "model.pt artifact (data_config['path']) is used. Use this to run "
+            'inference on a different dataset (must have the same feature layout).'
+        ),
+    )
+    parser.add_argument(
         '--device',
         type=str,
         default=None,
@@ -465,7 +475,11 @@ def main():
     # Build dataset
     print(f'\nBuilding dataset...')
     data_config = artifact['data_config']
-    dataset_dir = Path(data_config['path']).resolve()
+    if args.data_path is not None:
+        dataset_dir = Path(args.data_path).resolve()
+        print(f'Overriding dataset path with --data-path: {dataset_dir}')
+    else:
+        dataset_dir = Path(data_config['path']).resolve()
     split_id = data_config.get('split_id', lib.data.DEFAULT_SPLIT_ID)
     preprocessor = artifact.get('preprocessor')
     if preprocessor is not None:
@@ -475,7 +489,10 @@ def main():
     else:
         # Fallback to original build_dataset
         print('WARNING: No preprocessor found, using build_dataset (legacy)')
-        dataset = lib.data.build_dataset(**artifact['data_config'])
+        build_kwargs = dict(artifact['data_config'])
+        if args.data_path is not None:
+            build_kwargs['path'] = str(dataset_dir)
+        dataset = lib.data.build_dataset(**build_kwargs)
     
     # Only report parts that actually exist in the dataset (a dataset may contain
     # just a subset, e.g. only "train").
