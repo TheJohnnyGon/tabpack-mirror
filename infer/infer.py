@@ -477,7 +477,11 @@ def main():
         print('WARNING: No preprocessor found, using build_dataset (legacy)')
         dataset = lib.data.build_dataset(**artifact['data_config'])
     
-    print(f'  train: {dataset.size("train")}, val: {dataset.size("val")}, test: {dataset.size("test")}')
+    # Only report parts that actually exist in the dataset (a dataset may contain
+    # just a subset, e.g. only "train").
+    available_parts = list(dataset.parts())
+    sizes = ', '.join(f'{p}: {dataset.size(p)}' for p in available_parts)
+    print(f'  {sizes}')
     print(f'  n_num_features: {dataset.n_num_features}')
     print(f'  n_cat_features: {dataset.n_cat_features}')
     print(f'  n_bin_features: {dataset.n_bin_features}')
