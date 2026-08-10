@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import datetime
 import gc
@@ -5,7 +6,9 @@ import inspect
 import itertools
 import json
 import math
+import queue
 import statistics
+import threading
 import time
 import typing
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -225,6 +228,117 @@ class PinnedBatchStager:
             self._events[slot].record()  # type: ignore[union-attr]
             self._slot_recorded[slot] = True
         return result
+
+
+class PrefetchBatchStager:
+    """Prefetch pipeline: gather batch N+1 on a background thread while GPU
+    computes batch N.
+
+    This solves the fundamental problem with ``data_on_cpu=True`` + pack:
+    the CPU ``index_select`` gather is single-threaded (torch.set_num_threads(1))
+    and cannot overlap with GPU compute.  By preparing the next batch ahead of
+    time on a dedicated thread, the main training loop only does a cheap
+    ``queue.get()`` for already-GPU-resident tensors.
+
+    The pipeline uses a queue of depth 1 (classic producer-consumer with one
+    slot of lookahead).  At epoch boundaries the old thread is stopped and a
+    new one is spawned for the new batch iterator.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        stager: PinnedBatchStager,
+        dataset: lib.data.Dataset,
+        part: PartKey,
+        is_cuda: bool,
+    ) -> None:
+        self._device = device
+        self._stager = stager
+        self._dataset = dataset
+        self._part = part
+        self._is_cuda = is_cuda
+
+        # Sources (pinned CPU tensors).
+        self._x_num_src = (
+            dataset.data['x_num'][part] if 'x_num' in dataset.data else None
+        )
+        self._x_cat_src = (
+            dataset.data['x_cat'][part] if 'x_cat' in dataset.data else None
+        )
+
+        # Queue: producer puts (x_num, x_cat) tuple already on GPU.
+        self._q: queue.Queue[tuple[Tensor | None, Tensor | None]] = queue.Queue(maxsize=1)
+
+        # Background thread state.
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    # -- internal gather (runs on background thread) --------------------
+
+    def _gather_one(self, batch_idx: Tensor) -> tuple[Tensor | None, Tensor | None]:
+        """Gather a single batch using the pinned stager (same logic as
+        ``apply_model_impl`` but returns the GPU tensors directly)."""
+        idx_cpu = (
+            batch_idx if batch_idx.device.type == 'cpu' else batch_idx.cpu()
+        )
+
+        def prepare(key: str, src: Tensor | None) -> Tensor | None:
+            if src is None:
+                return None
+            flat_idx = idx_cpu.reshape(-1)
+            gathered = self._stager.gather(key, src, flat_idx)
+            return gathered.reshape(*idx_cpu.shape, src.shape[-1])
+
+        x_num = prepare('x_num', self._x_num_src)
+        x_cat = prepare('x_cat', self._x_cat_src)
+        return x_num, x_cat
+
+    def _producer(self, batches: list[Tensor]) -> None:
+        """Background thread: iterate over ``batches`` and push gathered
+        (x_num, x_cat) pairs onto the queue."""
+        for batch_idx in batches:
+            if self._stop_event.is_set():
+                break
+            x_num, x_cat = self._gather_one(batch_idx)
+            # put() blocks if the queue is full (main thread is slow),
+            # which is the correct back-pressure behaviour.
+            self._q.put((x_num, x_cat))
+        # Sentinel so the main thread unblocks even if it is waiting.
+        self._q.put((None, None))
+
+    # -- public API (called from main thread) --------------------------
+
+    def start(self, batches: list[Tensor]) -> None:
+        """Kill any previous thread and spawn a new producer for ``batches``."""
+        self.stop()
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._producer, args=(batches,), daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the background thread to exit and join it."""
+        if self._thread is not None:
+            self._stop_event.set()
+            self._thread.join(timeout=5)
+            self._thread = None
+        # Drain the queue so the next epoch starts clean.
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+
+    def next_batch(self) -> tuple[Tensor | None, Tensor | None]:
+        """Block until the next pre-gathered (x_num, x_cat) is available.
+
+        Returns ``(None, None)`` as a sentinel when the epoch is exhausted.
+        """
+        x_num, x_cat = self._q.get()
+        return x_num, x_cat
 
 
 class ApplyModel(Protocol):
@@ -1794,6 +1908,27 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 specs=feature_specs,
             )
             logger.debug('Created the pinned batch stager')
+
+        # >>> Prefetch pipeline (Variant 2)
+        # When data_on_cpu=True, the CPU gather (index_select) is single-threaded
+        # and blocks the main Python thread, leaving the GPU idle.  The prefetch
+        # stager runs the gather on a background thread so that by the time the
+        # main loop needs the next batch, it is already on the GPU.
+        use_prefetch = data_on_cpu and config.get('prefetch_batches', True)
+    else:
+        use_prefetch = False
+
+    prefetch_stager: None | PrefetchBatchStager = None
+    if use_prefetch and train_stager is not None:
+        prefetch_stager = PrefetchBatchStager(
+            device=device,
+            stager=train_stager,
+            dataset=dataset,
+            part='train',
+            is_cuda=device.type == 'cuda',
+        )
+        logger.debug('Created the prefetch batch stager')
+
     apply_model_train = (
         apply_model
         if train_stager is None
@@ -1990,13 +2125,35 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             )
         batch_losses = []
         batch_sizes = []
+
+        # Start prefetch thread for this epoch's batches.
+        if prefetch_stager is not None:
+            prefetch_stager.start(batches)
+
         for batch_idx in tqdm(
             batches,
             desc=str(lib.util.try_get_relative_path(exp)),
             leave=False,
             disable=not lib.env.is_local(),
         ):
-            if use_pairwise:
+            if prefetch_stager is not None:
+                # --- Prefetch path: features already on GPU ---
+                x_num, x_cat = prefetch_stager.next_batch()
+                if x_num is None and x_cat is None:
+                    break  # sentinel — epoch exhausted
+                # Use apply_model (which may wrap autocast) but bypass the
+                # CPU gather by passing pre-gathered GPU tensors directly.
+                with autocast if autocast is not None else contextlib.nullcontext():
+                    all_preds = model(x_num, x_cat).squeeze(-1).float()
+                if use_pairwise:
+                    bs = batch_idx.shape[BATCH_DIM]
+                    pred_pos = all_preds[:, :bs]
+                    pred_neg = all_preds[:, bs:]
+                    losses = loss_fn(pred_pos, pred_neg)
+                else:
+                    y_batch = Y_train[batch_idx]
+                    losses = loss_fn(all_preds, y_batch)
+            elif use_pairwise:
                 # When data_on_cpu=True, `train_pair_*_t` live on CPU, so
                 # indexing with the CPU `batch_idx` keeps everything on CPU —
                 # no GPU→CPU hop inside `apply_model_impl`.
@@ -2043,6 +2200,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             )
 
         epoch_training_duration = time.perf_counter() - epoch_training_start_time
+
+        # Stop prefetch thread for this epoch before evaluation.
+        if prefetch_stager is not None:
+            prefetch_stager.stop()
 
         del batches, batch_idx, losses, loss, loss_detached  # pyright: ignore[reportPossiblyUnboundVariable]
         _free_mps_memory()
