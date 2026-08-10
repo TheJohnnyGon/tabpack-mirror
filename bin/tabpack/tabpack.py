@@ -1685,13 +1685,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         print('Data on GPU, freed numpy arrays')
     
     # Convert pair indices to tensors.
-    # These are small int tensors, so we always keep them on the GPU (Variant 4),
-    # even when data_on_cpu=True. Indexing them with a CPU `batch_idx` is fine
-    # (PyTorch allows a CPU index on a CUDA tensor); the resulting pos/neg index
-    # tensors live on the GPU and are cheaply moved back to CPU inside
-    # `apply_model_impl` only for the CPU feature gather.
+    # When data_on_cpu=True, keep pair indices on CPU to avoid a per-batch
+    # GPU→CPU hop inside `apply_model_impl` (the `batch_idx.cpu()` call on
+    # line 267).  When data lives on GPU the indices are also cheap on CPU
+    # because labels (`Y_train`) are indexed separately and the feature gather
+    # path is not taken for pair indices.
     if use_pairwise:
-        pair_device = device
+        pair_device = 'cpu' if data_on_cpu else device
         train_pair_pos_t = torch.tensor(train_pair_pos, device=pair_device, dtype=torch.long)
         train_pair_neg_t = torch.tensor(train_pair_neg, device=pair_device, dtype=torch.long)
         eval_pairs_t = {
@@ -1997,10 +1997,12 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             disable=not lib.env.is_local(),
         ):
             if use_pairwise:
-                # `train_pair_*_t` live on the GPU (Variant 4); indexing them
-                # with the CPU `batch_idx` yields GPU index tensors. The staged
-                # gather inside `apply_model_impl` moves them back to CPU only
-                # for the CPU feature `index_select`.
+                # When data_on_cpu=True, `train_pair_*_t` live on CPU, so
+                # indexing with the CPU `batch_idx` keeps everything on CPU —
+                # no GPU→CPU hop inside `apply_model_impl`.
+                # When data_on_cpu=False, they live on GPU; the resulting
+                # GPU index tensors are moved back to CPU inside
+                # `apply_model_impl` only for the CPU feature `index_select`.
                 pos_idx = train_pair_pos_t[batch_idx]  # (pack_size, batch_size)
                 neg_idx = train_pair_neg_t[batch_idx]  # (pack_size, batch_size)
                 all_idx = torch.cat([pos_idx, neg_idx], dim=BATCH_DIM)  # (pack_size, 2*batch_size)
