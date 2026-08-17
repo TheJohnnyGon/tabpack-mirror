@@ -264,6 +264,7 @@ class PrefetchBatchStager:
         use_pairwise: bool = False,
         train_pair_pos_t: Tensor | None = None,
         train_pair_neg_t: Tensor | None = None,
+        queue_size: int = 1,
     ) -> None:
         self._device = device
         self._stager = stager
@@ -283,7 +284,8 @@ class PrefetchBatchStager:
         )
 
         # Queue: producer puts (x_num, x_cat) tuple already on GPU.
-        self._q: queue.Queue[tuple[Tensor | None, Tensor | None]] = queue.Queue(maxsize=1)
+        # queue_size controls how many batches to prefetch ahead (default: 1).
+        self._q: queue.Queue[tuple[Tensor | None, Tensor | None]] = queue.Queue(maxsize=queue_size)
 
         # Background thread state.
         self._thread: threading.Thread | None = None
@@ -1597,6 +1599,7 @@ class Config(TypedDict):
     timeout: NotRequired[int]
     data_on_cpu: NotRequired[bool]  # Keep data on CPU, move batches to GPU during training
     gather_num_threads: NotRequired[int]  # Number of threads for CPU gather (default: 1)
+    prefetch_queue_size: NotRequired[int]  # Number of batches to prefetch ahead (default: 1)
 
     # Report
     track_experiments: NotRequired[bool]
@@ -1952,6 +1955,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             use_pairwise=use_pairwise,
             train_pair_pos_t=train_pair_pos_t if use_pairwise else None,
             train_pair_neg_t=train_pair_neg_t if use_pairwise else None,
+            queue_size=config.get('prefetch_queue_size', 1),
         )
         logger.debug('Created the prefetch batch stager')
 
