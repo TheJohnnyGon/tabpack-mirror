@@ -261,12 +261,18 @@ class PrefetchBatchStager:
         dataset: lib.data.Dataset,
         part: PartKey,
         is_cuda: bool,
+        use_pairwise: bool = False,
+        train_pair_pos_t: Tensor | None = None,
+        train_pair_neg_t: Tensor | None = None,
     ) -> None:
         self._device = device
         self._stager = stager
         self._dataset = dataset
         self._part = part
         self._is_cuda = is_cuda
+        self._use_pairwise = use_pairwise
+        self._train_pair_pos_t = train_pair_pos_t
+        self._train_pair_neg_t = train_pair_neg_t
 
         # Sources (pinned CPU tensors).
         self._x_num_src = (
@@ -288,9 +294,16 @@ class PrefetchBatchStager:
     def _gather_one(self, batch_idx: Tensor) -> tuple[Tensor | None, Tensor | None]:
         """Gather a single batch using the pinned stager (same logic as
         ``apply_model_impl`` but returns the GPU tensors directly)."""
-        idx_cpu = (
-            batch_idx if batch_idx.device.type == 'cpu' else batch_idx.cpu()
-        )
+        # For pairwise: expand batch_idx to all_idx (pos+neg)
+        if self._use_pairwise:
+            pos_idx = self._train_pair_pos_t[batch_idx]  # (pack_size, batch_size)
+            neg_idx = self._train_pair_neg_t[batch_idx]  # (pack_size, batch_size)
+            all_idx = torch.cat([pos_idx, neg_idx], dim=BATCH_DIM)  # (pack_size, 2*batch_size)
+            idx_cpu = all_idx if all_idx.device.type == 'cpu' else all_idx.cpu()
+        else:
+            idx_cpu = (
+                batch_idx if batch_idx.device.type == 'cpu' else batch_idx.cpu()
+            )
 
         def prepare(key: str, src: Tensor | None) -> Tensor | None:
             if src is None:
@@ -1936,6 +1949,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             dataset=dataset,
             part='train',
             is_cuda=device.type == 'cuda',
+            use_pairwise=use_pairwise,
+            train_pair_pos_t=train_pair_pos_t if use_pairwise else None,
+            train_pair_neg_t=train_pair_neg_t if use_pairwise else None,
         )
         logger.debug('Created the prefetch batch stager')
 
