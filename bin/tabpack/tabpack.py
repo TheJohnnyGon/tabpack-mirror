@@ -174,6 +174,7 @@ class PinnedBatchStager:
         max_rows: int,
         specs: dict[str, tuple[int, torch.dtype]],
         ring_size: int = 2,
+        num_threads: int = 1,
     ) -> None:
         # specs: key -> (n_features, dtype) of the source (train) feature tensor.
         self._device = device
@@ -181,6 +182,7 @@ class PinnedBatchStager:
         self._ring_size = ring_size
         self._is_cuda = device.type == 'cuda'
         self._pos = 0
+        self._num_threads = num_threads
         # Pre-allocate `ring_size` pinned buffers per feature key.
         self._buffers: dict[str, list[Tensor]] = {}
         for key, (n_features, dtype) in specs.items():
@@ -222,7 +224,13 @@ class PinnedBatchStager:
             f'batch of {n} rows exceeds staging buffer capacity {self._max_rows}'
         )
         out = buf[:n]
-        torch.index_select(src, 0, flat_idx, out=out)
+        # Temporarily increase threads for faster CPU gather (only affects this op)
+        prev_threads = torch.get_num_threads()
+        torch.set_num_threads(self._num_threads)
+        try:
+            torch.index_select(src, 0, flat_idx, out=out)
+        finally:
+            torch.set_num_threads(prev_threads)
         result = out.to(self._device, non_blocking=self._is_cuda)
         if self._is_cuda:
             self._events[slot].record()  # type: ignore[union-attr]
@@ -1575,6 +1583,7 @@ class Config(TypedDict):
     amp_dtype: NotRequired[AMPDType]
     timeout: NotRequired[int]
     data_on_cpu: NotRequired[bool]  # Keep data on CPU, move batches to GPU during training
+    gather_num_threads: NotRequired[int]  # Number of threads for CPU gather (default: 1)
 
     # Report
     track_experiments: NotRequired[bool]
@@ -1906,6 +1915,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 device=device,
                 max_rows=max_rows,
                 specs=feature_specs,
+                num_threads=config.get('gather_num_threads', 1),
             )
             logger.debug('Created the pinned batch stager')
 

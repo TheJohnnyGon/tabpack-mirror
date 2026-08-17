@@ -488,6 +488,59 @@ shared_step = true
 
 ---
 
+### `gather_num_threads: NotRequired[int]`
+
+**По умолчанию:** `1`
+
+**Назначение:** Количество потоков для CPU gather операций при `data_on_cpu=True`.
+
+**Когда использовать:**
+- Когда `data_on_cpu=True` и обучение замедляется из-за single-threaded CPU gather
+- Когда нужно ускорить сборку батчей на CPU перед переносом на GPU
+- Когда вы работаете в single-process режиме (не multi-worker тюнинг)
+
+**Как работает:**
+При `data_on_cpu=True` батчи собираются на CPU через `torch.index_select()`. По умолчанию PyTorch использует 1 поток для CPU операций (установлено в `lib/util.py:configure_torch()`). Этот флаг временно увеличивает количество потоков **только на время gather операции**, не влияя на остальной код.
+
+```python
+# Внутри PinnedBatchStager.gather()
+prev_threads = torch.get_num_threads()
+torch.set_num_threads(self._num_threads)  # gather_num_threads из конфига
+try:
+    torch.index_select(src, 0, flat_idx, out=out)
+finally:
+    torch.set_num_threads(prev_threads)  # Возврат к 1
+```
+
+**Рекомендуемые значения:**
+- `1` (по умолчанию) — безопасно для multi-worker тюнинга
+- `4-8` — разумный баланс для single-process обучения
+- `16+` — может помочь на больших батчах, но рискует oversubscription
+
+**Предупреждения:**
+- **НЕ используйте в multi-worker тюнинге** (`bin/tune.py` с `n_workers > 1`) — это создаст oversubscription CPU и замедлит всё
+- **НЕ используйте `os.cpu_count()`** — в оркестраторе это может сломать другие процессы
+- Многопоточные операции могут быть недетерминированными (влияет на воспроизводимость)
+
+**Пример конфигурации:**
+```toml
+seed = 0
+n_models = 64
+batch_size = 1024
+data_on_cpu = true
+gather_num_threads = 8  # Ускорить CPU gather
+
+[data]
+path = "data/large_dataset"
+```
+
+**Взаимодействие с другими параметрами:**
+- `data_on_cpu` — имеет эффект только при `data_on_cpu=True`
+- `prefetch_batches` — работает вместе с prefetch pipeline (Variant 2)
+- `n_workers` (в tune.py) — при `n_workers > 1` оставьте `gather_num_threads=1`
+
+---
+
 ### `track_experiments: NotRequired[bool]`
 
 **По умолчанию:** `True` если `sampler is None`, иначе `False`
