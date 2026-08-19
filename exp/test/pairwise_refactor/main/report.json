@@ -1,0 +1,267 @@
+{
+    "function": "bin.tabpack.tabpack.main",
+    "n_models": 4,
+    "n_trials": 4,
+    "prediction_type": "logits",
+    "epoch_size": 200,
+    "online_ensembles": {
+        "greedy": {
+            "report": {
+                "ids": [
+                    0,
+                    1,
+                    3
+                ],
+                "step": 400,
+                "steps": [
+                    200,
+                    400,
+                    400
+                ],
+                "time": 42.285289917024784,
+                "ensemble_time": 0.001772582996636629,
+                "metrics": {
+                    "val": {
+                        "pair_accuracy": 0.8226026064967905,
+                        "score": 0.8226026064967905
+                    },
+                    "test": {
+                        "pair_accuracy": 0.8239532619279455,
+                        "score": 0.8239532619279455
+                    }
+                },
+                "history": [
+                    {
+                        "ids": [
+                            0,
+                            1,
+                            3
+                        ],
+                        "step": 200,
+                        "steps": [
+                            200,
+                            200,
+                            200
+                        ],
+                        "time": 19.952769833005732,
+                        "ensemble_time": 0.0007459580083377659,
+                        "metrics": {
+                            "val": {
+                                "pair_accuracy": 0.8179342540361797,
+                                "score": 0.8179342540361797
+                            },
+                            "test": {
+                                "pair_accuracy": 0.8241480038948393,
+                                "score": 0.8241480038948393
+                            }
+                        }
+                    },
+                    {
+                        "ids": [
+                            0,
+                            1,
+                            3
+                        ],
+                        "step": 400,
+                        "steps": [
+                            200,
+                            400,
+                            400
+                        ],
+                        "time": 42.285289917024784,
+                        "ensemble_time": 0.001772582996636629,
+                        "metrics": {
+                            "val": {
+                                "pair_accuracy": 0.8226026064967905,
+                                "score": 0.8226026064967905
+                            },
+                            "test": {
+                                "pair_accuracy": 0.8239532619279455,
+                                "score": 0.8239532619279455
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    },
+    "eval_batch_size": 32768,
+    "pair_accuracy": {
+        "val": 0.8226026064967905,
+        "test": 0.8239532619279455
+    },
+    "step": 400,
+    "experiments": [
+        {
+            "config": {
+                "model": {
+                    "n_blocks": 2,
+                    "dropout": 0.0
+                },
+                "optimizer": {
+                    "lr": 0.0008428303845098716,
+                    "weight_decay": 0.018662266976517967,
+                    "muon_lr": 0.019578897201213006
+                }
+            },
+            "report": {
+                "id": 0,
+                "best_step": 400,
+                "metrics": {
+                    "train": {
+                        "pair_accuracy": 0.8466943281011469,
+                        "score": 0.8466943281011469
+                    },
+                    "val": {
+                        "pair_accuracy": 0.815016533748298,
+                        "score": 0.815016533748298
+                    },
+                    "test": {
+                        "pair_accuracy": 0.8177215189873418,
+                        "score": 0.8177215189873418
+                    }
+                },
+                "time": 42.18685033300426
+            }
+        },
+        {
+            "config": {
+                "model": {
+                    "n_blocks": 1,
+                    "dropout": 0.1150324556477333
+                },
+                "optimizer": {
+                    "lr": 0.00221369146887824,
+                    "weight_decay": 0.03860866271460544,
+                    "muon_lr": 0.013680095279726922
+                }
+            },
+            "report": {
+                "id": 1,
+                "best_step": 400,
+                "metrics": {
+                    "train": {
+                        "pair_accuracy": 0.8366931537949661,
+                        "score": 0.8366931537949661
+                    },
+                    "val": {
+                        "pair_accuracy": 0.8173507099786034,
+                        "score": 0.8173507099786034
+                    },
+                    "test": {
+                        "pair_accuracy": 0.8202531645569621,
+                        "score": 0.8202531645569621
+                    }
+                },
+                "time": 42.18685033300426
+            }
+        },
+        {
+            "config": {
+                "model": {
+                    "n_blocks": 2,
+                    "dropout": 0.006065519232097715
+                },
+                "optimizer": {
+                    "lr": 0.002597742757002251,
+                    "weight_decay": 0.21600820741402038,
+                    "muon_lr": 0.05495716186411618
+                }
+            },
+            "report": {
+                "id": 2,
+                "best_step": 200,
+                "metrics": {
+                    "train": {
+                        "pair_accuracy": 0.8257133910048147,
+                        "score": 0.8257133910048147
+                    },
+                    "val": {
+                        "pair_accuracy": 0.804318226026065,
+                        "score": 0.804318226026065
+                    },
+                    "test": {
+                        "pair_accuracy": 0.8111002921129503,
+                        "score": 0.8111002921129503
+                    }
+                },
+                "time": 42.18685033300426
+            }
+        },
+        {
+            "config": {
+                "model": {
+                    "n_blocks": 2,
+                    "dropout": 0.0
+                },
+                "optimizer": {
+                    "lr": 0.0021188277784090774,
+                    "weight_decay": 0.0022637229697395483,
+                    "muon_lr": 0.019047678084282035
+                }
+            },
+            "report": {
+                "id": 3,
+                "best_step": 400,
+                "metrics": {
+                    "train": {
+                        "pair_accuracy": 0.8495126629349826,
+                        "score": 0.8495126629349826
+                    },
+                    "val": {
+                        "pair_accuracy": 0.8165726512351682,
+                        "score": 0.8165726512351682
+                    },
+                    "test": {
+                        "pair_accuracy": 0.8198636806231743,
+                        "score": 0.8198636806231743
+                    }
+                },
+                "time": 42.18685033300426
+            }
+        }
+    ],
+    "best": {
+        "config": {
+            "model": {
+                "n_blocks": 1,
+                "dropout": 0.1150324556477333
+            },
+            "optimizer": {
+                "lr": 0.00221369146887824,
+                "weight_decay": 0.03860866271460544,
+                "muon_lr": 0.013680095279726922
+            }
+        },
+        "report": {
+            "id": 1,
+            "best_step": 400,
+            "metrics": {
+                "train": {
+                    "pair_accuracy": 0.8366931537949661,
+                    "score": 0.8366931537949661
+                },
+                "val": {
+                    "pair_accuracy": 0.8173507099786034,
+                    "score": 0.8173507099786034
+                },
+                "test": {
+                    "pair_accuracy": 0.8202531645569621,
+                    "score": 0.8202531645569621
+                }
+            },
+            "time": 42.18685033300426
+        }
+    },
+    "time": 42.334056083025644,
+    "metrics": {
+        "val": {
+            "pair_accuracy": 0.8226026064967905,
+            "score": 0.8226026064967905
+        },
+        "test": {
+            "pair_accuracy": 0.8239532619279455,
+            "score": 0.8239532619279455
+        }
+    }
+}

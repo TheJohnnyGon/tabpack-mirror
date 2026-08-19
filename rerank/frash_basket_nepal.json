@@ -1,0 +1,487 @@
+{
+    "user_id" = "00b48d6d6c7b42ac82f15cb81f752a22";
+    "session_id" = "1783692477058_682d022f-6dec-4dde-b90b-360b27979131";
+    "client_id" = "yango";
+    "country" = "NP";
+    "country_short_en_name" = "NP";
+    "fielddate" = "2026-07-10";
+    "request_region" = 10613;
+    "requests" = [
+        {
+            "cgi" = [
+                [
+                    "client_id";
+                    "yango";
+                ];
+                [
+                    "client_reqid";
+                    "1783692477058_682d022f-6dec-4dde-b90b-360b27979131";
+                ];
+                [
+                    "lang";
+                    "en_US";
+                ];
+                [
+                    "origin";
+                    "yango_android;yango;";
+                ];
+                [
+                    "part";
+                    "Tindhara Sadak, 28";
+                ];
+                [
+                    "point_type";
+                    "a";
+                ];
+                [
+                    "search_type";
+                    "taxi";
+                ];
+                [
+                    "suggest_serpid";
+                    "6c893ea1-83ef-4b77-a609-dc3145f7109a";
+                ];
+                [
+                    "taxi_session_empty_serps";
+                    "0";
+                ];
+                [
+                    "taxi_session_secs";
+                    "0";
+                ];
+                [
+                    "ull";
+                    "85.3196140000,27.7091640000";
+                ];
+                [
+                    "v";
+                    "9";
+                ];
+            ];
+            "click_pos" = #;
+            "num" = 1u;
+            "results_prod" = [
+                "Nepal, Kathmandu, Ward 1, Tindhara Sadak, 28___TOPONYM";
+                "144920711330___ORG";
+                "78361020625___ORG";
+                "143905318144___ORG";
+                "Nepal, Kathmandu, Ward 1, Hattisar Sadak, 28___TOPONYM";
+                "148369235511___ORG";
+                "85887015096___ORG";
+            ];
+            "right_answer_index_prod" = #;
+            "text" = "tindhara sadak 28";
+            "ts" = 1783691987000;
+        };
+        {
+            "cgi" = [
+                [
+                    "client_id";
+                    "yango";
+                ];
+                [
+                    "client_reqid";
+                    "1783692479314_ea2ccc47-a84a-4259-93c5-671be3e87907";
+                ];
+                [
+                    "lang";
+                    "en_US";
+                ];
+                [
+                    "origin";
+                    "yango_android;yango;";
+                ];
+                [
+                    "part";
+                    "Tindhara Sadak, 28";
+                ];
+                [
+                    "point_type";
+                    "a";
+                ];
+                [
+                    "search_type";
+                    "taxi";
+                ];
+                [
+                    "suggest_serpid";
+                    "5cf974ce-92ee-480a-966b-8b50de666456";
+                ];
+                [
+                    "taxi_session_empty_serps";
+                    "0";
+                ];
+                [
+                    "taxi_session_secs";
+                    "0";
+                ];
+                [
+                    "ull";
+                    "85.3196140000,27.7091640000";
+                ];
+                [
+                    "v";
+                    "9";
+                ];
+            ];
+            "click_pos" = #;
+            "num" = 2u;
+            "results_prod" = [
+                "Nepal, Kathmandu, Ward 1, Tindhara Sadak, 28___TOPONYM";
+                "144920711330___ORG";
+                "78361020625___ORG";
+                "143905318144___ORG";
+                "Nepal, Kathmandu, Ward 1, Hattisar Sadak, 28___TOPONYM";
+                "148369235511___ORG";
+                "85887015096___ORG";
+            ];
+            "right_answer_index_prod" = #;
+            "text" = "tindhara sadak 28";
+            "ts" = 1783691990000;
+        };
+        {
+            "cgi" = [
+                [
+                    "client_id";
+                    "yango";
+                ];
+                [
+                    "client_reqid";
+                    "1783692482581_4ea25b66-1ab7-4b63-9fd8-80108fcb0038";
+                ];
+                [
+                    "lang";
+                    "en_US";
+                ];
+                [
+                    "origin";
+                    "yango_android;yango;";
+                ];
+                [
+                    "part";
+                    "harhw";
+                ];
+                [
+                    "point_type";
+                    "a";
+                ];
+                [
+                    "search_type";
+                    "taxi";
+                ];
+                [
+                    "suggest_serpid";
+                    "5cf974ce-92ee-480a-966b-8b50de666456";
+                ];
+                [
+                    "taxi_session_empty_serps";
+                    "0";
+                ];
+                [
+                    "taxi_session_secs";
+                    "0";
+                ];
+                [
+                    "ull";
+                    "85.3196140000,27.7091640000";
+                ];
+                [
+                    "v";
+                    "9";
+                ];
+            ];
+            "click_pos" = #;
+            "num" = 3u;
+            "results_prod" = [
+                "105614224459___ORG";
+                "220506040559___ORG";
+                "12881461882___ORG";
+                "134077076692___ORG";
+                "47918960316___ORG";
+                "222410564578___ORG";
+                "108166339250___ORG";
+            ];
+            "right_answer_index_prod" = #;
+            "text" = "harhw";
+            "ts" = 1783691993000;
+        };
+        {
+            "cgi" = [
+                [
+                    "client_id";
+                    "yango";
+                ];
+                [
+                    "client_reqid";
+                    "1783692483452_6d3ecd9c-7170-438d-b948-365434b82742";
+                ];
+                [
+                    "lang";
+                    "en_US";
+                ];
+                [
+                    "origin";
+                    "yango_android;yango;";
+                ];
+                [
+                    "part";
+                    "harh";
+                ];
+                [
+                    "point_type";
+                    "a";
+                ];
+                [
+                    "search_type";
+                    "taxi";
+                ];
+                [
+                    "suggest_serpid";
+                    "5cf974ce-92ee-480a-966b-8b50de666456";
+                ];
+                [
+                    "taxi_session_empty_serps";
+                    "0";
+                ];
+                [
+                    "taxi_session_secs";
+                    "0";
+                ];
+                [
+                    "ull";
+                    "85.3196140000,27.7091640000";
+                ];
+                [
+                    "v";
+                    "9";
+                ];
+            ];
+            "click_pos" = 0;
+            "num" = 4u;
+            "results_prod" = [
+                "105614224459___ORG";
+                "134077076692___ORG";
+                "47918960316___ORG";
+                "37394925018___ORG";
+                "87190308571___ORG";
+                "223831795383___ORG";
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 9, Hajur Ko Dhara Marg___TOPONYM";
+            ];
+            "right_answer_index_prod" = #;
+            "text" = "harh";
+            "ts" = 1783691994000;
+        };
+        {
+            "cgi" = [
+                [
+                    "client_id";
+                    "yango";
+                ];
+                [
+                    "client_reqid";
+                    "1783692489606_1951cb1a-45a1-4cb1-9dc9-94f671d31e97";
+                ];
+                [
+                    "event_number";
+                    "1";
+                ];
+                [
+                    "lang";
+                    "en_US";
+                ];
+                [
+                    "origin";
+                    "yango_android;yango;";
+                ];
+                [
+                    "part";
+                    "om";
+                ];
+                [
+                    "point_type";
+                    "b";
+                ];
+                [
+                    "search_type";
+                    "taxi";
+                ];
+                [
+                    "suggest_serpid";
+                    "83a27aeb-ccdc-4e56-96ce-173112aded4c";
+                ];
+                [
+                    "taxi_session_empty_serps";
+                    "0";
+                ];
+                [
+                    "taxi_session_secs";
+                    "10";
+                ];
+                [
+                    "ull";
+                    "85.3797000000,27.6964770000";
+                ];
+                [
+                    "v";
+                    "9";
+                ];
+            ];
+            "click_pos" = #;
+            "num" = 5u;
+            "results_prod" = [
+                "28230565970___ORG";
+                "128711934093___ORG";
+                "70933270048___ORG";
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 9, Om Nagar Marg___TOPONYM";
+                "88812213939___ORG";
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 8, Om Marg___TOPONYM";
+                "80591957961___ORG";
+            ];
+            "right_answer_index_prod" = 5u;
+            "text" = "om";
+            "ts" = 1783692000000;
+        };
+        {
+            "cgi" = [
+                [
+                    "client_id";
+                    "yango";
+                ];
+                [
+                    "client_reqid";
+                    "1783692494305_b93a3d2b-a491-47d6-8213-51e7a9e94e41";
+                ];
+                [
+                    "event_number";
+                    "2";
+                ];
+                [
+                    "lang";
+                    "en_US";
+                ];
+                [
+                    "origin";
+                    "yango_android;yango;";
+                ];
+                [
+                    "part";
+                    "om marga";
+                ];
+                [
+                    "point_type";
+                    "b";
+                ];
+                [
+                    "search_type";
+                    "taxi";
+                ];
+                [
+                    "suggest_serpid";
+                    "83a27aeb-ccdc-4e56-96ce-173112aded4c";
+                ];
+                [
+                    "taxi_session_empty_serps";
+                    "0";
+                ];
+                [
+                    "taxi_session_secs";
+                    "15";
+                ];
+                [
+                    "ull";
+                    "85.3797000000,27.6964770000";
+                ];
+                [
+                    "v";
+                    "9";
+                ];
+            ];
+            "click_pos" = #;
+            "num" = 6u;
+            "results_prod" = [
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 8, Om Marg___TOPONYM";
+                "14725906792___ORG";
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 8, Shree Om Marg___TOPONYM";
+                "38617600038___ORG";
+                "167864038542___ORG";
+                "120276379520___ORG";
+                "51640533604___ORG";
+            ];
+            "right_answer_index_prod" = 0u;
+            "text" = "om marga";
+            "ts" = 1783692005000;
+        };
+        {
+            "cgi" = [
+                [
+                    "client_id";
+                    "yango";
+                ];
+                [
+                    "client_reqid";
+                    "1783692495108_9dce5874-0945-4224-b0e2-7e84fe9a43fa";
+                ];
+                [
+                    "event_number";
+                    "3";
+                ];
+                [
+                    "lang";
+                    "en_US";
+                ];
+                [
+                    "origin";
+                    "yango_android;yango;";
+                ];
+                [
+                    "part";
+                    "om marg";
+                ];
+                [
+                    "point_type";
+                    "b";
+                ];
+                [
+                    "search_type";
+                    "taxi";
+                ];
+                [
+                    "suggest_serpid";
+                    "83a27aeb-ccdc-4e56-96ce-173112aded4c";
+                ];
+                [
+                    "taxi_session_empty_serps";
+                    "0";
+                ];
+                [
+                    "taxi_session_secs";
+                    "16";
+                ];
+                [
+                    "ull";
+                    "85.3797000000,27.6964770000";
+                ];
+                [
+                    "v";
+                    "9";
+                ];
+            ];
+            "click_pos" = 0;
+            "num" = 7u;
+            "results_prod" = [
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 8, Om Marg___TOPONYM";
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 9, Om Nagar Marg___TOPONYM";
+                "14725906792___ORG";
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 8, Shree Om Marg___TOPONYM";
+                "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 4, Om Marg___TOPONYM";
+                "Nepal, Kathmandu, Ward 9, Omnagar Marg___TOPONYM";
+                "167864038542___ORG";
+            ];
+            "right_answer_index_prod" = 0u;
+            "text" = "om marg";
+            "ts" = 1783692006000;
+        };
+    ];
+    "right_answer_dedup_id" = "Nepal, Bagmati, Kathmandu District, Kageshwari-Manohara Municipality, Ward 8, Om Marg___TOPONYM";
+    "table_type" = "taxi";
+};
