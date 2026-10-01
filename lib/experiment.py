@@ -210,7 +210,7 @@ def finish(exp: str | Path, report: Report) -> None:
     _stop_running(exp)
 
     print()
-    print(util.add_frame(load_summary(exp)))
+    print(load_summary(exp))
     backup(exp)
 
 
@@ -467,6 +467,12 @@ def _summarize_report(report: Report) -> JSONDict:
             summary['metrics'] = {
                 part: {'score': _summarize_score(part_metrics['score'])}
                 for part, part_metrics in value.items()
+            }
+
+        elif key == 'pair_accuracy':
+            summary['pair_accuracy'] = {
+                part: _summarize_score(score)
+                for part, score in value.items()
             }
 
         elif key == 'best':

@@ -421,6 +421,126 @@ while (
 
 ---
 
+### `data_on_cpu: NotRequired[bool]`
+
+**По умолчанию:** `False`
+
+**Назначение:** Хранить данные на CPU и перемещать батчи на GPU во время обучения.
+
+**Когда использовать:**
+- Когда датасет не помещается в GPU память
+- Когда нужно обучать на больших датасетах с ограниченной VRAM
+- Когда overhead от CPU→GPU transfer приемлем
+
+**Использование:**
+```python
+data_on_cpu = config.get('data_on_cpu', False)
+if data_on_cpu:
+    dataset = dataset.to_torch('cpu', pin_memory=True)
+    # Данные остаются на CPU с pinned memory
+    # Батчи перемещаются на GPU в apply_model_impl()
+else:
+    dataset = dataset.to_torch(device)
+    # Все данные на GPU
+```
+
+**Как работает:**
+1. Данные конвертируются в torch тензоры на CPU с `pin_memory=True`
+2. Batch индексы генерируются на CPU
+3. В [`apply_model_impl()`](../bin/tabpack/tabpack.py:158) данные индексируются на CPU
+4. Индексированные батчи перемещаются на GPU через `.to(device, non_blocking=True)`
+5. Модель работает с данными на GPU как обычно
+
+**Преимущества:**
+- Данные любого размера могут быть использованы (ограничение только RAM)
+- Pinned memory ускоряет CPU→GPU transfer
+- Non-blocking transfer позволяет overlap с вычислениями
+
+**Недостатки:**
+- Overhead от CPU→GPU transfer на каждом батче
+- Может быть медленнее для маленьких датасетов, которые помещаются в GPU
+
+**Пример конфигурации:**
+```toml
+seed = 0
+n_models = 64
+batch_size = 1024
+n_epochs = -1
+patience = 16
+data_on_cpu = true  # Данные остаются на CPU
+
+[data]
+path = "data/large_dataset"
+
+[model]
+activation = "SiLU"
+d_block = 384
+
+[optimizer]
+type = "MuonAdamWPack"
+shared_step = true
+```
+
+**Взаимодействие с другими параметрами:**
+- `amp_dtype` — работает как обычно, AMP применяется к данным на GPU
+- `batch_size` — может быть увеличен, так как на GPU только текущий батч
+- `eval_batch_size` — evaluation тоже использует CPU данные
+
+---
+
+### `gather_num_threads: NotRequired[int]`
+
+**По умолчанию:** `1`
+
+**Назначение:** Количество потоков для CPU gather операций при `data_on_cpu=True`.
+
+**Когда использовать:**
+- Когда `data_on_cpu=True` и обучение замедляется из-за single-threaded CPU gather
+- Когда нужно ускорить сборку батчей на CPU перед переносом на GPU
+- Когда вы работаете в single-process режиме (не multi-worker тюнинг)
+
+**Как работает:**
+При `data_on_cpu=True` батчи собираются на CPU через `torch.index_select()`. По умолчанию PyTorch использует 1 поток для CPU операций (установлено в `lib/util.py:configure_torch()`). Этот флаг временно увеличивает количество потоков **только на время gather операции**, не влияя на остальной код.
+
+```python
+# Внутри PinnedBatchStager.gather()
+prev_threads = torch.get_num_threads()
+torch.set_num_threads(self._num_threads)  # gather_num_threads из конфига
+try:
+    torch.index_select(src, 0, flat_idx, out=out)
+finally:
+    torch.set_num_threads(prev_threads)  # Возврат к 1
+```
+
+**Рекомендуемые значения:**
+- `1` (по умолчанию) — безопасно для multi-worker тюнинга
+- `4-8` — разумный баланс для single-process обучения
+- `16+` — может помочь на больших батчах, но рискует oversubscription
+
+**Предупреждения:**
+- **НЕ используйте в multi-worker тюнинге** (`bin/tune.py` с `n_workers > 1`) — это создаст oversubscription CPU и замедлит всё
+- **НЕ используйте `os.cpu_count()`** — в оркестраторе это может сломать другие процессы
+- Многопоточные операции могут быть недетерминированными (влияет на воспроизводимость)
+
+**Пример конфигурации:**
+```toml
+seed = 0
+n_models = 64
+batch_size = 1024
+data_on_cpu = true
+gather_num_threads = 8  # Ускорить CPU gather
+
+[data]
+path = "data/large_dataset"
+```
+
+**Взаимодействие с другими параметрами:**
+- `data_on_cpu` — имеет эффект только при `data_on_cpu=True`
+- `prefetch_batches` — работает вместе с prefetch pipeline (Variant 2)
+- `n_workers` (в tune.py) — при `n_workers > 1` оставьте `gather_num_threads=1`
+
+---
+
 ### `track_experiments: NotRequired[bool]`
 
 **По умолчанию:** `True` если `sampler is None`, иначе `False`

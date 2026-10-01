@@ -41,6 +41,35 @@ def make_emsemble_score_fn(
     return score_fn
 
 
+def make_pair_accuracy_score_fn(
+    pair_pos_indices: torch.Tensor,
+    pair_neg_indices: torch.Tensor,
+    device: torch.device,
+) -> EnsembleScoreFn:
+    """Create a score function that computes pair accuracy for ensemble evaluation.
+    
+    Args:
+        pair_pos_indices: (n_pairs,) indices of positive objects
+        pair_neg_indices: (n_pairs,) indices of negative objects
+        device: torch device
+    
+    Returns:
+        Score function that takes predictions (pack_size, n_samples) and returns
+        pair accuracy for each model in the pack.
+    """
+    pair_pos_indices = pair_pos_indices.to(device)
+    pair_neg_indices = pair_neg_indices.to(device)
+    
+    def score_fn(y_pred: torch.Tensor) -> torch.Tensor:
+        # y_pred: (pack_size, n_samples)
+        pred_pos = y_pred[:, pair_pos_indices]  # (pack_size, n_pairs)
+        pred_neg = y_pred[:, pair_neg_indices]  # (pack_size, n_pairs)
+        pair_acc = (pred_pos > pred_neg).float().mean(dim=1)  # (pack_size,)
+        return pair_acc
+    
+    return score_fn
+
+
 def _validate_predictions(predictions: Tensor) -> None:
     assert predictions.numel() > 0
     assert torch.isfinite(predictions).all()

@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import datetime
 import gc
@@ -5,7 +6,9 @@ import inspect
 import itertools
 import json
 import math
+import queue
 import statistics
+import threading
 import time
 import typing
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -144,6 +147,223 @@ class ModelPack(bin.tabpack.nn.ModulePack):
         return x
 
 
+class PinnedBatchStager:
+    """Reusable pinned CPU staging buffers for fast async H2D of batch features.
+
+    Motivation (data_on_cpu=True):
+    Advanced indexing (``src[batch_idx]``) allocates a *fresh, pageable* CPU
+    tensor every step. Copying a pageable tensor to the GPU is always
+    synchronous, so ``.to(device, non_blocking=True)`` silently degrades into a
+    blocking copy and the GPU stalls waiting for the transfer.
+
+    Instead we gather into a *pre-allocated pinned* buffer via
+    ``torch.index_select(src, 0, idx, out=buf)`` and copy ``buf[:n]`` to the
+    device with ``non_blocking=True``. Because the source is pinned, the copy is
+    truly asynchronous and can overlap with compute.
+
+    A small ring of buffers (+ CUDA events on CUDA) is used so the CPU does not
+    overwrite a buffer whose async copy is still in flight. This is *not* the
+    prefetch pipeline of Variant 2 (no dedicated stream, no double buffering of
+    whole batches ahead) — it only guarantees correctness of buffer reuse.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        max_rows: int,
+        specs: dict[str, tuple[int, torch.dtype]],
+        ring_size: int = 2,
+        num_threads: int = 1,
+    ) -> None:
+        # specs: key -> (n_features, dtype) of the source (train) feature tensor.
+        self._device = device
+        self._max_rows = max_rows
+        self._ring_size = ring_size
+        self._is_cuda = device.type == 'cuda'
+        self._pos = 0
+        self._num_threads = num_threads
+        # Pre-allocate `ring_size` pinned buffers per feature key.
+        self._buffers: dict[str, list[Tensor]] = {}
+        for key, (n_features, dtype) in specs.items():
+            self._buffers[key] = [
+                torch.empty(
+                    (max_rows, n_features),
+                    dtype=dtype,
+                    pin_memory=self._is_cuda,
+                )
+                for _ in range(ring_size)
+            ]
+        # One event per ring slot, tracking the last H2D copy that read it.
+        self._events: list[None | torch.cuda.Event] = (
+            [torch.cuda.Event() for _ in range(ring_size)]
+            if self._is_cuda
+            else [None] * ring_size
+        )
+        self._slot_recorded = [False] * ring_size
+
+    def _next_slot(self) -> int:
+        slot = self._pos
+        self._pos = (self._pos + 1) % self._ring_size
+        # Make sure the previous async copy out of this slot has finished
+        # before we overwrite the pinned buffer.
+        if self._is_cuda and self._slot_recorded[slot]:
+            self._events[slot].synchronize()  # type: ignore[union-attr]
+        return slot
+
+    def gather(self, key: str, src: Tensor, flat_idx: Tensor) -> Tensor:
+        """Gather rows ``src[flat_idx]`` into a pinned buffer and move to device.
+
+        ``flat_idx`` must be a 1-D CPU LongTensor. Returns a 2-D device tensor
+        of shape ``(len(flat_idx), n_features)``.
+        """
+        slot = self._next_slot()
+        buf = self._buffers[key][slot]
+        n = flat_idx.shape[0]
+        assert n <= self._max_rows, (
+            f'batch of {n} rows exceeds staging buffer capacity {self._max_rows}'
+        )
+        out = buf[:n]
+        # Temporarily increase threads for faster CPU gather (only affects this op)
+        prev_threads = torch.get_num_threads()
+        torch.set_num_threads(self._num_threads)
+        try:
+            torch.index_select(src, 0, flat_idx, out=out)
+        finally:
+            torch.set_num_threads(prev_threads)
+        result = out.to(self._device, non_blocking=self._is_cuda)
+        if self._is_cuda:
+            self._events[slot].record()  # type: ignore[union-attr]
+            self._slot_recorded[slot] = True
+        return result
+
+
+class PrefetchBatchStager:
+    """Prefetch pipeline: gather batch N+1 on a background thread while GPU
+    computes batch N.
+
+    This solves the fundamental problem with ``data_on_cpu=True`` + pack:
+    the CPU ``index_select`` gather is single-threaded (torch.set_num_threads(1))
+    and cannot overlap with GPU compute.  By preparing the next batch ahead of
+    time on a dedicated thread, the main training loop only does a cheap
+    ``queue.get()`` for already-GPU-resident tensors.
+
+    The pipeline uses a queue of depth 1 (classic producer-consumer with one
+    slot of lookahead).  At epoch boundaries the old thread is stopped and a
+    new one is spawned for the new batch iterator.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        stager: PinnedBatchStager,
+        dataset: lib.data.Dataset,
+        part: PartKey,
+        is_cuda: bool,
+        use_pairwise: bool = False,
+        train_pair_pos_t: Tensor | None = None,
+        train_pair_neg_t: Tensor | None = None,
+        queue_size: int = 1,
+    ) -> None:
+        self._device = device
+        self._stager = stager
+        self._dataset = dataset
+        self._part = part
+        self._is_cuda = is_cuda
+        self._use_pairwise = use_pairwise
+        self._train_pair_pos_t = train_pair_pos_t
+        self._train_pair_neg_t = train_pair_neg_t
+
+        # Sources (pinned CPU tensors).
+        self._x_num_src = (
+            dataset.data['x_num'][part] if 'x_num' in dataset.data else None
+        )
+        self._x_cat_src = (
+            dataset.data['x_cat'][part] if 'x_cat' in dataset.data else None
+        )
+
+        # Queue: producer puts (x_num, x_cat) tuple already on GPU.
+        # queue_size controls how many batches to prefetch ahead (default: 1).
+        self._q: queue.Queue[tuple[Tensor | None, Tensor | None]] = queue.Queue(maxsize=queue_size)
+
+        # Background thread state.
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    # -- internal gather (runs on background thread) --------------------
+
+    def _gather_one(self, batch_idx: Tensor) -> tuple[Tensor | None, Tensor | None]:
+        """Gather a single batch using the pinned stager (same logic as
+        ``apply_model_impl`` but returns the GPU tensors directly)."""
+        # For pairwise: expand batch_idx to all_idx (pos+neg)
+        if self._use_pairwise:
+            pos_idx = self._train_pair_pos_t[batch_idx]  # (pack_size, batch_size)
+            neg_idx = self._train_pair_neg_t[batch_idx]  # (pack_size, batch_size)
+            all_idx = torch.cat([pos_idx, neg_idx], dim=BATCH_DIM)  # (pack_size, 2*batch_size)
+            idx_cpu = all_idx if all_idx.device.type == 'cpu' else all_idx.cpu()
+        else:
+            idx_cpu = (
+                batch_idx if batch_idx.device.type == 'cpu' else batch_idx.cpu()
+            )
+
+        def prepare(key: str, src: Tensor | None) -> Tensor | None:
+            if src is None:
+                return None
+            flat_idx = idx_cpu.reshape(-1)
+            gathered = self._stager.gather(key, src, flat_idx)
+            return gathered.reshape(*idx_cpu.shape, src.shape[-1])
+
+        x_num = prepare('x_num', self._x_num_src)
+        x_cat = prepare('x_cat', self._x_cat_src)
+        return x_num, x_cat
+
+    def _producer(self, batches: list[Tensor]) -> None:
+        """Background thread: iterate over ``batches`` and push gathered
+        (x_num, x_cat) pairs onto the queue."""
+        for batch_idx in batches:
+            if self._stop_event.is_set():
+                break
+            x_num, x_cat = self._gather_one(batch_idx)
+            # put() blocks if the queue is full (main thread is slow),
+            # which is the correct back-pressure behaviour.
+            self._q.put((x_num, x_cat))
+        # Sentinel so the main thread unblocks even if it is waiting.
+        self._q.put((None, None))
+
+    # -- public API (called from main thread) --------------------------
+
+    def start(self, batches: list[Tensor]) -> None:
+        """Kill any previous thread and spawn a new producer for ``batches``."""
+        self.stop()
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._producer, args=(batches,), daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the background thread to exit and join it."""
+        if self._thread is not None:
+            self._stop_event.set()
+            self._thread.join(timeout=5)
+            self._thread = None
+        # Drain the queue so the next epoch starts clean.
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+
+    def next_batch(self) -> tuple[Tensor | None, Tensor | None]:
+        """Block until the next pre-gathered (x_num, x_cat) is available.
+
+        Returns ``(None, None)`` as a sentinel when the epoch is exhausted.
+        """
+        x_num, x_cat = self._q.get()
+        return x_num, x_cat
+
+
 class ApplyModel(Protocol):
     def __call__(
         self,
@@ -152,17 +372,52 @@ class ApplyModel(Protocol):
         *,
         part: PartKey,
         batch_idx: Tensor,
+        stager: None | PinnedBatchStager = ...,
     ) -> Tensor: ...
 
 
 def apply_model_impl(
-    model: nn.Module, dataset: lib.data.Dataset, *, part: PartKey, batch_idx: Tensor
+    model: nn.Module,
+    dataset: lib.data.Dataset,
+    *,
+    part: PartKey,
+    batch_idx: Tensor,
+    stager: None | PinnedBatchStager = None,
 ) -> Tensor:
+    # Get the device from model parameters
+    device = next(model.parameters()).device
+
+    x_num_src = dataset.data['x_num'][part] if 'x_num' in dataset.data else None
+    x_cat_src = dataset.data['x_cat'][part] if 'x_cat' in dataset.data else None
+
+    def prepare(key: str, src: None | Tensor) -> None | Tensor:
+        if src is None:
+            return None
+        # Fast path: data already lives on the model device (data_on_cpu=False).
+        # Advanced indexing keeps everything on-device; nothing to transfer.
+        if src.device == device:
+            return src[batch_idx]
+        # data_on_cpu=True: src is a pinned CPU tensor.
+        # `batch_idx` may be on the GPU (e.g. pairwise pos/neg indices computed
+        # from GPU pair tensors). index_select requires the index on the same
+        # device as `src`, so bring the (small) index tensor back to CPU.
+        idx_cpu = batch_idx if batch_idx.device.type == 'cpu' else batch_idx.cpu()
+        if stager is not None:
+            # Staged async H2D via pinned buffer. `index_select` needs a 1-D
+            # index, so flatten (pack, batch) -> (pack*batch) and restore shape.
+            flat_idx = idx_cpu.reshape(-1)
+            gathered = stager.gather(key, src, flat_idx)
+            return gathered.reshape(*idx_cpu.shape, src.shape[-1])
+        # Fallback (e.g. evaluation): gather on CPU then async copy. Without a
+        # pinned staging buffer the copy is effectively synchronous, but eval is
+        # far less latency-sensitive than the training loop.
+        return src[idx_cpu].to(device, non_blocking=True)
+
+    x_num = prepare('x_num', x_num_src)
+    x_cat = prepare('x_cat', x_cat_src)
+
     return (
-        model(
-            dataset.data['x_num'][part][batch_idx] if 'x_num' in dataset.data else None,
-            dataset.data['x_cat'][part][batch_idx] if 'x_cat' in dataset.data else None,
-        )
+        model(x_num, x_cat)
         .squeeze(-1)  # Remove the last dimension for regression predictions.
         .float()
     )
@@ -805,6 +1060,8 @@ def update_online_ensembles(
     task: lib.data.Task,
     step: int,
     timer: delu.tools.Timer,
+    use_pairwise: bool = False,
+    eval_pairs_t: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     **kwargs,
 ) -> tuple[dict[str, lib.experiment.Report], bool]:
     reports = {}
@@ -824,9 +1081,25 @@ def update_online_ensembles(
                 )
                 for k, v in ensemble._predictions.items()
             }
-            metrics = task.calculate_metrics(
-                ensemble_predictions, ensemble._prediction_type
-            )
+            
+            # For pairwise tasks, compute only pair_accuracy
+            if use_pairwise and eval_pairs_t is not None:
+                metrics = {}
+                for part, (pos_idx, neg_idx) in eval_pairs_t.items():
+                    if part in ensemble_predictions:
+                        pred = ensemble_predictions[part]
+                        # Convert torch indices to numpy for indexing numpy predictions
+                        pos_idx_np = pos_idx.cpu().numpy()
+                        neg_idx_np = neg_idx.cpu().numpy()
+                        pred_pos = pred[pos_idx_np]
+                        pred_neg = pred[neg_idx_np]
+                        pair_acc = float((pred_pos > pred_neg).mean())
+                        metrics[part] = {'pair_accuracy': pair_acc, 'score': pair_acc}
+            else:
+                # For standard tasks, use calculate_metrics
+                metrics = task.calculate_metrics(
+                    ensemble_predictions, ensemble._prediction_type
+                )
 
             reports[ensemble_name] = {
                 'ids': ensemble.ids.tolist(),
@@ -855,15 +1128,45 @@ def generate_training_batches(
     batch_generator: torch.Generator,
     pack_size: int,
 ) -> list[Tensor]:
-    """Generate training batches for one epoch."""
+    """Generate training batches for one epoch.
+    
+    Returns batch indices on CPU for indexing CPU data tensors.
+    The random generation and argsort happen on the generator's device
+    (usually GPU) for speed, then results are moved to CPU.
+    """
     random_values = torch.rand(
         (pack_size, train_size),
         generator=batch_generator,
         device=batch_generator.device,
     )
-    batches = random_values.argsort(dim=BATCH_DIM).split(batch_size, dim=BATCH_DIM)
+    # argsort on GPU for speed, then move to CPU for indexing CPU data
+    batches = random_values.argsort(dim=BATCH_DIM).cpu().split(batch_size, dim=BATCH_DIM)
     batches = list(batches)
     return batches
+
+
+def generate_pair_training_batches(
+    *,
+    n_pairs: int,
+    batch_size: int,
+    batch_generator: torch.Generator,
+    pack_size: int,
+) -> list[Tensor]:
+    """Generate training batches of pair indices for one epoch.
+    
+    Returns list of tensors with shape (pack_size, batch_size) — indices into pair arrays.
+    Same per-model shuffling pattern as generate_training_batches().
+    
+    Returns batch indices on CPU for indexing CPU data tensors.
+    """
+    random_values = torch.rand(
+        (pack_size, n_pairs),
+        generator=batch_generator,
+        device=batch_generator.device,
+    )
+    # argsort on GPU for speed, then move to CPU for indexing CPU data
+    batches = random_values.argsort(dim=BATCH_DIM).cpu().split(batch_size, dim=BATCH_DIM)
+    return list(batches)
 
 
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
@@ -887,6 +1190,8 @@ def _evaluate(
     prediction_type: str | PredictionType,
     batch_size: int,
     device: torch.device,
+    use_pairwise: bool = False,
+    eval_pairs_t: None | dict[PartKey, tuple[Tensor, Tensor]] = None,
 ) -> _EvaluateOutput:
     model.eval()
     del optimizer
@@ -896,38 +1201,53 @@ def _evaluate(
     predictions_torch = {}
 
     for part in parts:
+        # Generate batch indices on CPU for indexing CPU data tensors
+        # apply_model_impl will move the indexed batch to GPU
         y_pred_torch = torch.cat(
             [
                 apply_model(model, dataset, part=part, batch_idx=batch_idx)
-                for batch_idx in torch.arange(dataset.size(part), device=device).split(
-                    batch_size
-                )
+                for batch_idx in torch.arange(dataset.size(part)).split(batch_size)
             ],
             dim=BATCH_DIM,
         )
 
-        if dataset.task.is_regression:
-            assert regression_label_stats is not None
-            y_pred_torch *= regression_label_stats.std
-            y_pred_torch += regression_label_stats.mean
-
-        elif dataset.task.is_binclass:
-            y_pred_torch = torch.special.expit(y_pred_torch)
-
+        if use_pairwise:
+            # Raw logits — no transformation needed for pairwise
+            y_pred = y_pred_torch.cpu().numpy()
+            
+            assert eval_pairs_t is not None
+            pos_idx, neg_idx = eval_pairs_t[part]
+            pred_pos = y_pred[:, pos_idx.cpu().numpy()]
+            pred_neg = y_pred[:, neg_idx.cpu().numpy()]
+            pair_acc = (pred_pos > pred_neg).mean(axis=1)
+            
+            metrics[part] = {
+                'pair_accuracy': pair_acc,
+                'score': pair_acc,  # score = pair_accuracy (higher is better)
+            }
         else:
-            assert dataset.task.is_multiclass
-            y_pred_torch = torch.special.softmax(y_pred_torch, dim=-1)
+            if dataset.task.is_regression:
+                assert regression_label_stats is not None
+                y_pred_torch *= regression_label_stats.std
+                y_pred_torch += regression_label_stats.mean
 
-        y_pred = y_pred_torch.cpu().numpy()
+            elif dataset.task.is_binclass:
+                y_pred_torch = torch.special.expit(y_pred_torch)
 
-        assert np.isfinite(y_pred).all()
-        metrics[part] = bin.tabpack.metrics.calculate_metrics_pack(
-            y_true=dataset.task.labels[part],
-            y_pred=y_pred,
-            task_type=dataset.task.type_,
-            prediction_type=prediction_type,
-            score=dataset.task.score,
-        )
+            else:
+                assert dataset.task.is_multiclass
+                y_pred_torch = torch.special.softmax(y_pred_torch, dim=-1)
+
+            y_pred = y_pred_torch.cpu().numpy()
+
+            assert np.isfinite(y_pred).all()
+            metrics[part] = bin.tabpack.metrics.calculate_metrics_pack(
+                y_true=dataset.task.labels[part],
+                y_pred=y_pred,
+                task_type=dataset.task.type_,
+                prediction_type=prediction_type,
+                score=dataset.task.score,
+            )
         predictions[part] = y_pred
         predictions_torch[part] = y_pred_torch
 
@@ -967,23 +1287,36 @@ def _make_online_ensembles(
     prediction_type: PredictionType,
     update_part: PartKey,
     device: torch.device,
+    use_pairwise: bool = False,
+    eval_pairs_t: dict[PartKey, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> dict[str, OnlineEnsemble]:
-    score_fn = bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
-        task,
-        prediction_type,
-        part=update_part,
-        device=device,
-    )
-    loss_score_fn = (
-        bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
-            dataclasses.replace(task, score=lib.data.Score.CROSS_ENTROPY),
+    if use_pairwise:
+        # For pairwise, use pair accuracy as score function
+        assert eval_pairs_t is not None, "eval_pairs_t required for pairwise"
+        pair_pos_indices, pair_neg_indices = eval_pairs_t[update_part]
+        score_fn = bin.tabpack.ensemble_utils_torch.make_pair_accuracy_score_fn(
+            pair_pos_indices,
+            pair_neg_indices,
+            device=device,
+        )
+        loss_score_fn = None  # Not applicable for pairwise
+    else:
+        score_fn = bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
+            task,
             prediction_type,
             part=update_part,
             device=device,
         )
-        if task.is_classification
-        else None
-    )
+        loss_score_fn = (
+            bin.tabpack.ensemble_utils_torch.make_emsemble_score_fn(
+                dataclasses.replace(task, score=lib.data.Score.CROSS_ENTROPY),
+                prediction_type,
+                part=update_part,
+                device=device,
+            )
+            if task.is_classification
+            else None
+        )
 
     online_ensembles = {}
     for name, ensemble_config in online_ensemble_configs.items():
@@ -1060,6 +1393,109 @@ def _make_loss_fn_pack(task_type: TaskType) -> Callable[[Tensor, Tensor], Tensor
         return losses.mean(BATCH_DIM)
 
     return loss_fn_pack
+
+
+def form_pairs(
+    keys: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Form adjacent pairs within each key group.
+    
+    Assumes keys are contiguous (objects with the same key are consecutive).
+    Fully vectorized O(n) implementation for large datasets (50M+ rows).
+    
+    Handles:
+    - Keys with 1 object: skipped (no pairs formed)
+    - Keys with 2 objects: 1 pair formed
+    - Keys with 3+ objects: all adjacent pairs formed (e.g., [0,1,0] → 2 pairs)
+    
+    Returns:
+        pair_pos_indices: (n_pairs,) int64 — indices of positive objects
+        pair_neg_indices: (n_pairs,) int64 — indices of negative objects
+    """
+    # Find adjacent pairs with the same key
+    same_key = keys[:-1] == keys[1:]  # (n-1,)
+    pair_starts = np.where(same_key)[0]
+    
+    # Get labels for both elements of each pair
+    l0 = labels[pair_starts]
+    l1 = labels[pair_starts + 1]
+    
+    # Identify which element is positive (label=1) and which is negative (label=0)
+    # Pairs where both are positive or both are negative are automatically skipped
+    mask_pos_first = (l0 == 1) & (l1 == 0)
+    mask_pos_second = (l0 == 0) & (l1 == 1)
+    
+    # Build positive and negative index arrays
+    pos_first = pair_starts[mask_pos_first]
+    neg_first = pair_starts[mask_pos_first] + 1
+    pos_second = pair_starts[mask_pos_second] + 1
+    neg_second = pair_starts[mask_pos_second]
+    
+    # Concatenate and sort by the first index of each pair to preserve order
+    pos_indices = np.concatenate([pos_first, pos_second])
+    neg_indices = np.concatenate([neg_first, neg_second])
+    
+    # Sort by the minimum index in each pair to preserve original order
+    pair_min_idx = np.minimum(pos_indices, neg_indices)
+    sort_order = np.argsort(pair_min_idx)
+    
+    pos_indices = pos_indices[sort_order]
+    neg_indices = neg_indices[sort_order]
+    
+    return pos_indices, neg_indices
+
+
+def _make_bce_pairwise_loss_fn_pack() -> Callable[[Tensor, Tensor], Tensor]:
+    """BCE pairwise loss (RankNet-style).
+    
+    Encourages pred_pos > pred_neg via BCEWithLogits on (pred_pos - pred_neg).
+    """
+    def loss_fn_pack(pred_pos: Tensor, pred_neg: Tensor) -> Tensor:
+        diff = pred_pos - pred_neg
+        losses = nn.functional.binary_cross_entropy_with_logits(
+            diff, torch.ones_like(diff), reduction='none'
+        )
+        return losses.mean(dim=BATCH_DIM)
+    
+    return loss_fn_pack
+
+
+def _make_margin_ranknet_loss_fn_pack(margin: float = 1.0) -> Callable[[Tensor, Tensor], Tensor]:
+    """Margin RankNet pairwise loss.
+    
+    Encourages pred_pos - pred_neg > margin via hinge loss.
+    """
+    def loss_fn_pack(pred_pos: Tensor, pred_neg: Tensor) -> Tensor:
+        diff = pred_pos - pred_neg
+        losses = torch.clamp(margin - diff, min=0.0)
+        return losses.mean(dim=BATCH_DIM)
+    
+    return loss_fn_pack
+
+
+def _make_pairwise_loss_fn_pack(pairwise_config: KWArgs | None = None) -> Callable[[Tensor, Tensor], Tensor]:
+    """Create a pairwise loss function for pack training.
+    
+    Args:
+        pairwise_config: Config dict with 'loss' key. Supported values:
+            - 'bce' (default): BCEWithLogits on (pred_pos - pred_neg)
+            - 'margin_ranknet': Hinge loss with margin on (pred_pos - pred_neg)
+    
+    Returns:
+        Loss function that takes (pred_pos, pred_neg) and returns (pack_size,) tensor.
+    """
+    if pairwise_config is None:
+        pairwise_config = {}
+    
+    loss_type = pairwise_config.get('loss', 'bce')
+    
+    if loss_type == 'bce':
+        return _make_bce_pairwise_loss_fn_pack()
+    elif loss_type == 'margin_ranknet':
+        margin = pairwise_config.get('margin', 1.0)
+        return _make_margin_ranknet_loss_fn_pack(margin=margin)
+    else:
+        raise ValueError(f'Unknown pairwise loss type: {loss_type!r}. Supported: bce, margin_ranknet')
 
 
 def _get_mean_scores(
@@ -1144,6 +1580,9 @@ class Config(TypedDict):
     n_epochs: int
     patience: int
 
+    # Pairwise (only for task.type == 'pairwise')
+    pairwise: NotRequired[KWArgs]  # e.g. {'loss': 'bce'} or {'loss': 'margin_ranknet', 'margin': 1.0}
+
     # Evaluation
     eval_parts: NotRequired[list[PartKey]]
     eval_batch_size: NotRequired[int]
@@ -1158,6 +1597,9 @@ class Config(TypedDict):
     # Efficiency
     amp_dtype: NotRequired[AMPDType]
     timeout: NotRequired[int]
+    data_on_cpu: NotRequired[bool]  # Keep data on CPU, move batches to GPU during training
+    gather_num_threads: NotRequired[int]  # Number of threads for CPU gather (default: 1)
+    prefetch_queue_size: NotRequired[int]  # Number of batches to prefetch ahead (default: 1)
 
     # Report
     track_experiments: NotRequired[bool]
@@ -1341,14 +1783,71 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
 
     assert dataset.n_bin_features == 0
     print(f'Dataset loaded: {dataset.size("train")} train, {dataset.size("val")} val, {dataset.size("test")} test')
+    
+    # >>> Pairwise setup
+    use_pairwise = dataset.task.is_pairwise
+    eval_parts = config.get('eval_parts', ['val', 'test'])
+    
+    if use_pairwise:
+        assert 'key' in dataset.data, "key.npy is required for pairwise task"
+        
+        # Form pairs for train
+        train_pair_pos, train_pair_neg = form_pairs(
+            dataset.data['key']['train'],
+            dataset.task.labels['train'],
+        )
+        print(f'Formed {len(train_pair_pos)} training pairs')
+        
+        # Form pairs for val/test (for evaluation)
+        eval_pairs = {}
+        for part in eval_parts:
+            if part in dataset.data['key']:
+                eval_pairs[part] = form_pairs(
+                    dataset.data['key'][part],
+                    dataset.task.labels[part],
+                )
+                print(f'Formed {len(eval_pairs[part][0])} {part} pairs')
+    
     regression_label_stats = dataset.try_standardize_labels_()
-    print('Moving data to GPU...')
-    dataset = dataset.to_torch(device)
-    # Free numpy arrays that were replaced by torch tensors on GPU.
-    _free_mps_memory()
-    print('Data on GPU, freed numpy arrays')
+    
+    # >>> Data loading mode
+    data_on_cpu = config.get('data_on_cpu', False)
+    if data_on_cpu:
+        print('Converting data to torch tensors on CPU (with pin_memory)...')
+        dataset = dataset.to_torch('cpu', pin_memory=True)
+        _free_mps_memory()
+        print('Data on CPU with pinned memory, batches will be moved to GPU during training')
+    else:
+        print('Moving data to GPU...')
+        dataset = dataset.to_torch(device)
+        _free_mps_memory()
+        print('Data on GPU, freed numpy arrays')
+    
+    # Convert pair indices to tensors.
+    # When data_on_cpu=True, keep pair indices on CPU to avoid a per-batch
+    # GPU→CPU hop inside `apply_model_impl` (the `batch_idx.cpu()` call on
+    # line 267).  When data lives on GPU the indices are also cheap on CPU
+    # because labels (`Y_train`) are indexed separately and the feature gather
+    # path is not taken for pair indices.
+    if use_pairwise:
+        pair_device = 'cpu' if data_on_cpu else device
+        train_pair_pos_t = torch.tensor(train_pair_pos, device=pair_device, dtype=torch.long)
+        train_pair_neg_t = torch.tensor(train_pair_neg, device=pair_device, dtype=torch.long)
+        eval_pairs_t = {
+            'train': (train_pair_pos_t, train_pair_neg_t),
+            **{
+                part: (
+                    torch.tensor(pos, device=pair_device, dtype=torch.long),
+                    torch.tensor(neg, device=pair_device, dtype=torch.long),
+                )
+                for part, (pos, neg) in eval_pairs.items()
+            }
+        }
+    
     n_classes = dataset.task.try_compute_n_classes()
-    Y_train = _make_Y_train(dataset)
+    # Variant 4: keep the (small) training labels on the GPU even when
+    # data_on_cpu=True, so the per-step label transfer disappears from the loop.
+    Y_train = _make_Y_train(dataset).to(device)
     train_size = dataset.size('train')
 
     # >>> Hyperparameter sampler
@@ -1404,10 +1903,67 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     # NOTE
     # Predictions must be stored in aggregation-friendly units
     # for ensembling purposes (raw logits do _not_ meet this requirement).
-    prediction_type = (
-        PredictionType.LABELS if dataset.task.is_regression else PredictionType.PROBS
-    )
+    # For pairwise, we use LOGITS since we want raw scores for ranking.
+    if use_pairwise:
+        prediction_type = PredictionType.LOGITS
+    else:
+        prediction_type = (
+            PredictionType.LABELS if dataset.task.is_regression else PredictionType.PROBS
+        )
     apply_model = apply_model_impl if autocast is None else autocast(apply_model_impl)
+
+    # >>> Pinned staging buffer for async H2D during training (Variant 1)
+    # Only needed when data lives on CPU. `apply_model_impl` uses it to gather
+    # each batch into a pre-allocated pinned buffer via `index_select` so that
+    # the subsequent `.to(device, non_blocking=True)` is a genuine async copy.
+    train_stager: None | PinnedBatchStager = None
+    if data_on_cpu:
+        # A training batch has `pack_size` independently shuffled rows of size
+        # `batch_size`; for pairwise we gather pos+neg together => 2x rows.
+        max_rows = state.pack_size * config['batch_size'] * (2 if use_pairwise else 1)
+        feature_specs: dict[str, tuple[int, torch.dtype]] = {}
+        for key in ('x_num', 'x_cat'):
+            if key in dataset.data:
+                src = dataset.data[key]['train']
+                feature_specs[key] = (src.shape[-1], src.dtype)
+        if feature_specs:
+            train_stager = PinnedBatchStager(
+                device=device,
+                max_rows=max_rows,
+                specs=feature_specs,
+                num_threads=config.get('gather_num_threads', 1),
+            )
+            logger.debug('Created the pinned batch stager')
+
+        # >>> Prefetch pipeline (Variant 2)
+        # When data_on_cpu=True, the CPU gather (index_select) is single-threaded
+        # and blocks the main Python thread, leaving the GPU idle.  The prefetch
+        # stager runs the gather on a background thread so that by the time the
+        # main loop needs the next batch, it is already on the GPU.
+        use_prefetch = data_on_cpu and config.get('prefetch_batches', True)
+    else:
+        use_prefetch = False
+
+    prefetch_stager: None | PrefetchBatchStager = None
+    if use_prefetch and train_stager is not None:
+        prefetch_stager = PrefetchBatchStager(
+            device=device,
+            stager=train_stager,
+            dataset=dataset,
+            part='train',
+            is_cuda=device.type == 'cuda',
+            use_pairwise=use_pairwise,
+            train_pair_pos_t=train_pair_pos_t if use_pairwise else None,
+            train_pair_neg_t=train_pair_neg_t if use_pairwise else None,
+            queue_size=config.get('prefetch_queue_size', 1),
+        )
+        logger.debug('Created the prefetch batch stager')
+
+    apply_model_train = (
+        apply_model
+        if train_stager is None
+        else partial(apply_model, stager=train_stager)
+    )
 
     # >>> Ensembles
     online_ensemble_configs = config.get('online_ensembles')
@@ -1421,6 +1977,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             prediction_type=prediction_type,
             update_part='val',
             device=device,
+            use_pairwise=use_pairwise,
+            eval_pairs_t=eval_pairs_t if use_pairwise else None,
         )
         online_ensemble_history = {}
     logger.debug('Created the ensembles')
@@ -1460,8 +2018,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     )
     del configs_T
 
-    loss_fn = _make_loss_fn_pack(dataset.task.type_)
-    epoch_size = math.ceil(train_size / config['batch_size'])
+    if use_pairwise:
+        loss_fn = _make_pairwise_loss_fn_pack(config.get('pairwise'))
+        n_train_pairs = len(train_pair_pos)
+        epoch_size = math.ceil(n_train_pairs / config['batch_size'])
+    else:
+        loss_fn = _make_loss_fn_pack(dataset.task.type_)
+        epoch_size = math.ceil(train_size / config['batch_size'])
 
     # >>> Evaluation
     # The following order of `torch.inference_mode` and `partial` preserves
@@ -1476,6 +2039,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             regression_label_stats=regression_label_stats,
             prediction_type=prediction_type,
             device=device,
+            use_pairwise=use_pairwise,
+            eval_pairs_t=eval_pairs_t if use_pairwise else None,
         )
     )
     logger.debug('Created the evaluation function')
@@ -1528,6 +2093,9 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
     best_scores_improved = False
     first_online_ensemble_scores = None
     first_online_ensemble_improved = False
+    
+    # For pair logit, track pair accuracy for logging
+    pair_accuracy_scores = None
 
     # >>> Report
     report['n_models'] = 0
@@ -1571,24 +2139,74 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
         epoch_training_start_time = time.perf_counter()
         model.train()
 
-        batches = generate_training_batches(
-            train_size=train_size,
-            batch_size=config['batch_size'],
-            batch_generator=batch_generator,
-            pack_size=state.pack_size,
-        )
+        if use_pairwise:
+            batches = generate_pair_training_batches(
+                n_pairs=n_train_pairs,
+                batch_size=config['batch_size'],
+                batch_generator=batch_generator,
+                pack_size=state.pack_size,
+            )
+        else:
+            batches = generate_training_batches(
+                train_size=train_size,
+                batch_size=config['batch_size'],
+                batch_generator=batch_generator,
+                pack_size=state.pack_size,
+            )
         batch_losses = []
         batch_sizes = []
+
+        # Start prefetch thread for this epoch's batches.
+        if prefetch_stager is not None:
+            prefetch_stager.start(batches)
+
         for batch_idx in tqdm(
             batches,
             desc=str(lib.util.try_get_relative_path(exp)),
             leave=False,
             disable=not lib.env.is_local(),
         ):
-            losses = loss_fn(
-                apply_model(model, dataset, part='train', batch_idx=batch_idx),
-                Y_train[batch_idx],
-            )
+            if prefetch_stager is not None:
+                # --- Prefetch path: features already on GPU ---
+                x_num, x_cat = prefetch_stager.next_batch()
+                if x_num is None and x_cat is None:
+                    break  # sentinel — epoch exhausted
+                # Use apply_model (which may wrap autocast) but bypass the
+                # CPU gather by passing pre-gathered GPU tensors directly.
+                with autocast if autocast is not None else contextlib.nullcontext():
+                    all_preds = model(x_num, x_cat).squeeze(-1).float()
+                if use_pairwise:
+                    bs = batch_idx.shape[BATCH_DIM]
+                    pred_pos = all_preds[:, :bs]
+                    pred_neg = all_preds[:, bs:]
+                    losses = loss_fn(pred_pos, pred_neg)
+                else:
+                    y_batch = Y_train[batch_idx]
+                    losses = loss_fn(all_preds, y_batch)
+            elif use_pairwise:
+                # When data_on_cpu=True, `train_pair_*_t` live on CPU, so
+                # indexing with the CPU `batch_idx` keeps everything on CPU —
+                # no GPU→CPU hop inside `apply_model_impl`.
+                # When data_on_cpu=False, they live on GPU; the resulting
+                # GPU index tensors are moved back to CPU inside
+                # `apply_model_impl` only for the CPU feature `index_select`.
+                pos_idx = train_pair_pos_t[batch_idx]  # (pack_size, batch_size)
+                neg_idx = train_pair_neg_t[batch_idx]  # (pack_size, batch_size)
+                all_idx = torch.cat([pos_idx, neg_idx], dim=BATCH_DIM)  # (pack_size, 2*batch_size)
+                all_preds = apply_model_train(model, dataset, part='train', batch_idx=all_idx)
+                bs = batch_idx.shape[BATCH_DIM]
+                pred_pos = all_preds[:, :bs]
+                pred_neg = all_preds[:, bs:]
+                losses = loss_fn(pred_pos, pred_neg)
+            else:
+                # `Y_train` lives on the GPU (Variant 4). Indexing it with the
+                # CPU `batch_idx` produces the label batch directly on the GPU,
+                # so no per-step label transfer is needed.
+                y_batch = Y_train[batch_idx]
+                losses = loss_fn(
+                    apply_model_train(model, dataset, part='train', batch_idx=batch_idx),
+                    y_batch,
+                )
             # The scale of the gradients should not depend on the number of models,
             # so the individual losses are summed, not averaged.
             loss = losses.sum()
@@ -1613,6 +2231,10 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
 
         epoch_training_duration = time.perf_counter() - epoch_training_start_time
 
+        # Stop prefetch thread for this epoch before evaluation.
+        if prefetch_stager is not None:
+            prefetch_stager.stop()
+
         del batches, batch_idx, losses, loss, loss_detached  # pyright: ignore[reportPossiblyUnboundVariable]
         _free_mps_memory()
 
@@ -1635,6 +2257,13 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             predictions_torch=eval_predictions_torch,
             model_state_dict=model.state_dict(),
         )
+        
+        # Update pair accuracy scores for logging
+        if use_pairwise:
+            pair_accuracy_scores = {
+                part: float(np.mean(metrics['pair_accuracy']))
+                for part, metrics in eval_metrics.items()
+            }
 
         pack_epochs_numlog.append(
             deepcopy(
@@ -1754,7 +2383,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                     report.get('best'), new_experiments
                 )
             report['time'] = timer.elapsed()
-
+            
             # Make the update visible.
             lib.experiment.dump_report(exp, report)
 
@@ -1773,6 +2402,8 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 task=dataset.task,
                 step=step,
                 timer=timer,
+                use_pairwise=use_pairwise,
+                eval_pairs_t=eval_pairs_t,
                 running_ids=state.ids,
                 running_steps=state.steps,
                 running_best_predictions=state.best_predictions,
@@ -1796,6 +2427,15 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                         online_ensemble_history[ensemble_name]
                     )
                 del ensemble_name, ensemble_report
+
+            # Save pair_accuracy from ensemble to report for summary.txt
+            if use_pairwise and ensemble_reports:
+                first_ensemble_report = next(iter(ensemble_reports.values()))
+                report['pair_accuracy'] = {
+                    part: metrics.get('pair_accuracy', 0.0)
+                    for part, metrics in first_ensemble_report['metrics'].items()
+                    if 'pair_accuracy' in metrics
+                }
 
             # Save ensemble snapshot when improved ($ appears)
             # This is necessary for update_type='latest' because the ensemble is built
@@ -1881,7 +2521,11 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 iter(report['online_ensembles'].values())
             )
             first_online_ensemble_scores = {
-                part: part_metrics['score']
+                part: (
+                    part_metrics.get('pair_accuracy', part_metrics['score'])
+                    if use_pairwise
+                    else part_metrics['score']
+                )
                 for part, part_metrics in (
                     first_online_ensemble_experiment['report']
                     .get('metrics', {})
@@ -1909,16 +2553,26 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 f'[{part[0]}*] {score:.3f}' for part, score in best_scores.items()
             )
         )
+        ensemble_suffix = '@' if use_pairwise else '$'
         first_online_ensemble_scores_message = (
             None
             if first_online_ensemble_scores is None or not first_online_ensemble_scores
             else ' '.join(
-                f'[{part[0]}$] {score:.3f}'
+                f'[{part[0]}{ensemble_suffix}] {score:.3f}'
                 for part, score in first_online_ensemble_scores.items()
             )
         )
+        pair_accuracy_message = (
+            None
+            # For pairwise, pair accuracy is shown in ensemble output, skip [v@]
+            if pair_accuracy_scores is None or use_pairwise
+            else ' '.join(
+                f'[{part[0]}@] {score:.3f}'
+                for part, score in pair_accuracy_scores.items()
+            )
+        )
         print(
-            f'{"$" if first_online_ensemble_improved else " "}'
+            f'{ensemble_suffix if first_online_ensemble_improved else " "}'
             f'{"*" if best_scores_improved else " "}'
             f' [E] {step // epoch_size:<3}'
             f' [T] {datetime.timedelta(seconds=math.trunc(timer.elapsed()))}'
@@ -1927,6 +2581,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
             f'{"" if mean_scores_message is None else f" {mean_scores_message}"}'
             f'{"" if best_scores_message is None else f" {best_scores_message}"}'
             f'{"" if first_online_ensemble_scores_message is None else f" {first_online_ensemble_scores_message}"}'  # noqa: E501
+            f'{"" if pair_accuracy_message is None else f" {pair_accuracy_message}"}'
             f' [it/s] {training_throughput:<3} | {total_training_throughput:<5}'
             # f' [e/t] {epoch_evaluation_duration / epoch_training_duration:.3f}'
         )
@@ -2087,6 +2742,7 @@ def main(config: Config, exp: str | Path) -> lib.experiment.Report:
                 'data_config': data_config_to_save,
                 'ensemble': ensemble_info,
                 'preprocessor': preprocessor,
+                'use_pairwise': use_pairwise,
             },
             exp / 'model.pt',
         )

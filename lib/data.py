@@ -813,6 +813,7 @@ class Score(enum.Enum):
     R2 = 'r2'
     RMSE = 'rmse'
     ROC_AUC = 'roc-auc'
+    PAIR_ACCURACY = 'pair_accuracy'
 
 
 _SCORE_HIGHER_IS_BETTER = {
@@ -822,6 +823,7 @@ _SCORE_HIGHER_IS_BETTER = {
     Score.R2: True,
     Score.RMSE: False,
     Score.ROC_AUC: True,
+    Score.PAIR_ACCURACY: True,
 }
 
 
@@ -864,6 +866,10 @@ class Task:
         return self.type_ == TaskType.MULTICLASS
 
     @property
+    def is_pairwise(self) -> bool:
+        return self.type_ == TaskType.PAIRWISE
+
+    @property
     def is_classification(self) -> bool:
         return self.is_binclass or self.is_multiclass
 
@@ -872,7 +878,7 @@ class Task:
         return len(np.unique(np.concatenate(list(self.labels.values()))))
 
     def try_compute_n_classes(self) -> None | int:
-        return None if self.is_regression else self.compute_n_classes()
+        return None if self.is_regression or self.is_pairwise else self.compute_n_classes()
 
     def calculate_metrics(
         self,
@@ -915,17 +921,34 @@ class Dataset[T: np.ndarray | Tensor]:
     def _is_numpy(self) -> bool:
         return isinstance(self.data['y']['train'], np.ndarray)
 
-    def to_torch(self, device: None | str | torch.device) -> 'Dataset[Tensor]':
-        return Dataset(
-            {
-                key: {
-                    part: torch.as_tensor(value, device=device)
-                    for part, value in self.data[key].items()
-                }
-                for key in self.data
-            },
-            self.task,
-        )
+    def to_torch(
+        self,
+        device: None | str | torch.device = 'cpu',
+        pin_memory: bool = False,
+    ) -> 'Dataset[Tensor]':
+        """Convert dataset to torch tensors.
+        
+        Args:
+            device: Target device for tensors. Default is 'cpu'.
+            pin_memory: If True and device is 'cpu', use pinned memory for faster
+                CPU→GPU transfers. Useful when data stays on CPU and batches are
+                moved to GPU during training.
+        
+        Returns:
+            New Dataset with torch.Tensor data.
+        """
+        result_data = {}
+        for key in self.data:
+            result_data[key] = {}
+            for part, value in self.data[key].items():
+                tensor = torch.as_tensor(value)
+                if pin_memory and str(device) == 'cpu' and tensor.is_floating_point():
+                    tensor = tensor.pin_memory()
+                if device is not None and str(device) != 'cpu':
+                    tensor = tensor.to(device)
+                result_data[key][part] = tensor
+        
+        return Dataset(result_data, self.task)
 
     @property
     def n_num_features(self) -> int:

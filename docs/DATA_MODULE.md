@@ -203,6 +203,55 @@ splits/
 - [`compute_cat_cardinalities()`](lib/data.py:975) — кардинальности категорий
 - [`try_standardize_labels_()`](lib/data.py:1016) — стандартизация для регрессии
 
+### [`to_torch()`](lib/data.py:937) — Конвертация в torch tensors
+
+**Сигнатура:**
+```python
+def to_torch(
+    self,
+    device: None | str | torch.device = 'cpu',
+    pin_memory: bool = False,
+) -> 'Dataset[Tensor]'
+```
+
+**Параметры:**
+- `device` — целевое устройство для тензоров (по умолчанию `'cpu'`)
+- `pin_memory` — использовать pinned memory для ускорения CPU→GPU transfer
+
+**Режимы работы:**
+
+1. **GPU режим (по умолчанию в старом коде):**
+   ```python
+   dataset = dataset.to_torch(device)  # device = 'cuda:0'
+   # Все данные перемещаются на GPU
+   ```
+
+2. **CPU режим с pinned memory (новый режим для больших датасетов):**
+   ```python
+   dataset = dataset.to_torch('cpu', pin_memory=True)
+   # Данные остаются на CPU с pinned memory
+   # Батчи перемещаются на GPU во время обучения
+   ```
+
+**Когда использовать CPU режим:**
+- Датасет не помещается в GPU память
+- Нужно обучать на больших датасетах с ограниченной VRAM
+- Overhead от CPU→GPU transfer приемлем
+
+**Как работает CPU режим:**
+1. Данные конвертируются в torch тензоры на CPU
+2. Для floating-point тензоров применяется `pin_memory()` для ускорения transfer
+3. Во время обучения в [`apply_model_impl()`](../bin/tabpack/tabpack.py:158) данные индексируются на CPU
+4. Индексированные батчи перемещаются на GPU через `.to(device, non_blocking=True)`
+5. Модель работает с данными на GPU как обычно
+
+**Конфигурация:**
+```toml
+data_on_cpu = true  # Включить CPU режим
+```
+
+См. [`CONFIG.md`](CONFIG.md#data_on_cpu-notrequiredbool) для деталей.
+
 ---
 
 ## [`build_dataset()`](lib/data.py:1023)

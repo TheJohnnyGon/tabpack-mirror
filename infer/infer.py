@@ -156,6 +156,9 @@ def evaluate_ensemble(
 
     prediction_type = PredictionType(artifact['prediction_type'])
     regression_label_stats = artifact.get('regression_label_stats')
+    
+    # Detect pairwise model from explicit flag in model.pt
+    use_pairwise = artifact.get('use_pairwise', False)
 
     # Reconstruct RegressionLabelStats if needed
     reg_stats = None
@@ -164,6 +167,21 @@ def evaluate_ensemble(
             mean=regression_label_stats['mean'],
             std=regression_label_stats['std'],
         )
+    
+    # Form pairs for evaluation if pairwise model
+    eval_pairs_t = None
+    if use_pairwise and 'key' in dataset.data:
+        eval_pairs_t = {}
+        for part in parts:
+            if part in dataset.data['key']:
+                pos, neg = bin.tabpack.tabpack.form_pairs(
+                    dataset.data['key'][part],
+                    dataset.task.labels[part],
+                )
+                eval_pairs_t[part] = (
+                    torch.tensor(pos, device=device, dtype=torch.long),
+                    torch.tensor(neg, device=device, dtype=torch.long),
+                )
 
     # Move dataset to torch
     dataset_torch = dataset.to_torch(device)
@@ -184,6 +202,8 @@ def evaluate_ensemble(
             prediction_type=prediction_type,
             batch_size=batch_size,
             device=device,
+            use_pairwise=use_pairwise,
+            eval_pairs_t=eval_pairs_t,
         )
         # _evaluate returns tuple (result, batch_size) due to decorator
         if isinstance(eval_result, tuple):
@@ -209,15 +229,28 @@ def evaluate_ensemble(
         
         ensemble_predictions[part] = avg_pred
 
-        # Calculate metrics for the averaged prediction using lib.metrics
-        # which provides full classification_report (f1, precision, recall, roc-auc)
-        import lib.metrics
-        ensemble_metrics[part] = lib.metrics.calculate_metrics(
-            y_true=dataset.task.labels[part],
-            y_pred=avg_pred,
-            task_type=dataset.task.type_,
-            prediction_type=prediction_type,
-        )
+        if use_pairwise:
+            # Compute pair accuracy on averaged ensemble predictions
+            if eval_pairs_t and part in eval_pairs_t:
+                pos_idx, neg_idx = eval_pairs_t[part]
+                pos_idx_np = pos_idx.cpu().numpy()
+                neg_idx_np = neg_idx.cpu().numpy()
+                pred_pos = avg_pred[pos_idx_np]
+                pred_neg = avg_pred[neg_idx_np]
+                pair_acc = float((pred_pos > pred_neg).mean())
+                ensemble_metrics[part] = {'pair_accuracy': pair_acc, 'score': pair_acc}
+            else:
+                ensemble_metrics[part] = result.metrics[part]
+        else:
+            # Calculate metrics for the averaged prediction using lib.metrics
+            # which provides full classification_report (f1, precision, recall, roc-auc)
+            import lib.metrics
+            ensemble_metrics[part] = lib.metrics.calculate_metrics(
+                y_true=dataset.task.labels[part],
+                y_pred=avg_pred,
+                task_type=dataset.task.type_,
+                prediction_type=prediction_type,
+            )
 
     return {
         'metrics': ensemble_metrics,
@@ -390,7 +423,10 @@ def main():
     for part in args.parts:
         metrics = result['metrics'][part]
         print(f'  [{part}]')
-        # Show key metrics: accuracy, roc-auc, f1-macro, f1-micro
+        # Show key metrics: pair_accuracy (for pairwise), accuracy, roc-auc, f1-macro, f1-micro
+        if 'pair_accuracy' in metrics:
+            pair_acc = metrics['pair_accuracy']
+            print(f'    pair_accuracy:  {pair_acc:.4f}' if isinstance(pair_acc, float) else f'    pair_accuracy:  {pair_acc[0]:.4f}')
         if 'accuracy' in metrics:
             acc = metrics['accuracy']
             print(f'    accuracy:  {acc:.4f}' if isinstance(acc, float) else f'    accuracy:  {acc[0]:.4f}')
@@ -403,6 +439,31 @@ def main():
         if 'weighted avg' in metrics and 'f1-score' in metrics['weighted avg']:
             f1_micro = metrics['weighted avg']['f1-score']
             print(f'    f1-micro:  {f1_micro:.4f}' if isinstance(f1_micro, float) else f'    f1-micro:  {f1_micro[0]:.4f}')
+
+    # Print sample pairs (first 20 pairs)
+    use_pairwise = artifact.get('use_pairwise', False)
+    if use_pairwise and 'key' in dataset.data:
+        for part in args.parts:
+            if part in dataset.data['key']:
+                preds = result['predictions'][part]
+                keys = dataset.data['key'][part]
+                labels = dataset.task.labels[part]
+                pos_idx, neg_idx = bin.tabpack.tabpack.form_pairs(keys, labels)
+                n_show = min(20, len(pos_idx))
+                print(f'\n=== Sample Pairs [{part}] (first {n_show} of {len(pos_idx)}) ===')
+                header = f'{"Pair":<5} {"Key":<18} {"Pred+":>9} {"Pred-":>9} {"Diff":>9} {"OK"}'
+                print(f'  {header}')
+                print(f'  {"-"*len(header)}')
+                for i in range(n_show):
+                    p_idx = int(pos_idx[i])
+                    n_idx = int(neg_idx[i])
+                    pred_pos = float(preds[p_idx])
+                    pred_neg = float(preds[n_idx])
+                    diff = pred_pos - pred_neg
+                    correct = diff > 0
+                    key_val = str(int(keys[p_idx]))[:17]
+                    marker = '✓' if correct else '✗'
+                    print(f'  {i+1:<5} {key_val:<18} {pred_pos:>9.4f} {pred_neg:>9.4f} {diff:>9.4f} {marker}')
 
     # Compare with Nirvana results if requested
     if args.compare_nirvana:
